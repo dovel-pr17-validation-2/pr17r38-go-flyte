@@ -1,0 +1,57 @@
+# Todo(alex): We should add UI into the image when UI is done
+
+FROM --platform=${BUILDPLATFORM} golang:1.27.3-bookworm AS flytebuilder
+
+ARG TARGETARCH
+ENV GOARCH="${TARGETARCH}"
+ENV GOOS=linux
+ENV CGO_ENABLED=0
+
+WORKDIR /flyteorg/build
+
+COPY go.mod go.sum ./
+RUN mkdir flyteidl2 flyteplugins flytestdlib && go mod download
+
+COPY dataproxy dataproxy
+COPY executor executor
+COPY flytecopilot flytecopilot
+COPY flyteidl2 flyteidl2
+COPY flyteplugins flyteplugins
+COPY flytestdlib flytestdlib
+COPY gen/go gen/go
+COPY actions actions
+COPY app app
+COPY events events
+COPY runs runs
+COPY cache_service cache_service
+COPY secret secret
+
+COPY manager manager
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    go build -v -o dist/flyte ./manager/cmd/
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    go build -v -o dist/flyte-copilot ./flytecopilot
+
+
+FROM debian:bookworm-slim
+
+ARG FLYTE_VERSION
+ENV FLYTE_VERSION="${FLYTE_VERSION}"
+
+ENV DEBCONF_NONINTERACTIVE_SEEN=true
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install core packages
+RUN apt-get update && apt-get install --no-install-recommends --yes \
+        ca-certificates \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy compiled executables into image. flyteplugins invokes copilot as
+# `/bin/flyte-copilot` (flytek8s.CopilotCommandArgs), so it must live at that
+# exact path; the copilot init/sidecar container can then reuse this image.
+COPY --from=flytebuilder /flyteorg/build/dist/flyte /usr/local/bin/
+COPY --from=flytebuilder /flyteorg/build/dist/flyte-copilot /bin/flyte-copilot
+
+# Set entrypoint
+ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/usr/local/bin/flyte" ]

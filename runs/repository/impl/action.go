@@ -1,0 +1,1507 @@
+package impl
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+
+	"github.com/flyteorg/flyte/v2/flytestdlib/database"
+	"github.com/flyteorg/flyte/v2/flytestdlib/logger"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/common"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/core"
+	"github.com/flyteorg/flyte/v2/runs/repository/interfaces"
+	"github.com/flyteorg/flyte/v2/runs/repository/models"
+)
+
+const (
+	rootActionName                                   = "a0"
+	defaultNotificationBufferSize                    = 256
+	defaultWatchBufferSize                           = 100
+	notifyRetryMinBackoff                            = 50 * time.Millisecond
+	notifyRetryMaxBackoff                            = 5 * time.Second
+	defaultNotifyBatchSize                           = 100
+	maxNotifyBatchSize                               = 10_000
+	notificationMeterName                            = "runs-repository"
+	notificationDeletedMetricName                    = "runs.notification.evictions"
+	notificationDroppedMetricName                    = "runs.notification.subscriber_drops"
+	notificationSentMetricName                       = "runs.notification.sent"
+	notificationBufferAction      notificationBuffer = "action"
+	notificationBufferRun         notificationBuffer = "run"
+)
+
+// Defaults for the pq.Listener behind LISTEN/NOTIFY.
+const (
+	defaultListenerPingInterval         = 90 * time.Second
+	defaultListenerMinReconnectInterval = 10 * time.Second
+)
+
+// terminalPhases are the phases an action ends in. FAILED and TIMED_OUT can
+// still move on when the action is retried (see UpdateActionPhase).
+var terminalPhases = []int32{
+	int32(common.ActionPhase_ACTION_PHASE_SUCCEEDED),
+	int32(common.ActionPhase_ACTION_PHASE_FAILED),
+	int32(common.ActionPhase_ACTION_PHASE_ABORTED),
+	int32(common.ActionPhase_ACTION_PHASE_TIMED_OUT),
+	int32(common.ActionPhase_ACTION_PHASE_RECOVERED),
+}
+
+// activePhases is every ActionPhase not in terminalPhases.
+var activePhases = []int32{
+	int32(common.ActionPhase_ACTION_PHASE_UNSPECIFIED),
+	int32(common.ActionPhase_ACTION_PHASE_QUEUED),
+	int32(common.ActionPhase_ACTION_PHASE_WAITING_FOR_RESOURCES),
+	int32(common.ActionPhase_ACTION_PHASE_INITIALIZING),
+	int32(common.ActionPhase_ACTION_PHASE_RUNNING),
+	int32(common.ActionPhase_ACTION_PHASE_PAUSED),
+}
+
+type notificationBuffer string
+
+// NotificationConfig configures the pending notification queues and delivery retries.
+type NotificationConfig struct {
+	bufferLimit     int
+	retryMinBackoff time.Duration
+	retryMaxBackoff time.Duration
+	// watchBufferSize is the capacity of each watch subscriber's notification channel. A notification for a
+	// subscriber whose channel is full is dropped.
+	watchBufferSize int
+	// batchSize is the maximum number of notifications sent in one pg_notify statement.
+	batchSize int
+}
+
+type notificationMetrics struct {
+	notifyDeletedCount           metric.Int64Counter
+	subscriberDroppedNotifyCount metric.Int64Counter
+	notifySentCount              metric.Int64Counter
+}
+
+func newNotificationMetrics(provider metric.MeterProvider) (*notificationMetrics, error) {
+	if provider == nil {
+		return nil, nil
+	}
+	if _, ok := provider.(metricnoop.MeterProvider); ok {
+		return nil, nil
+	}
+
+	notifyDeletedCount, err := provider.Meter(notificationMeterName).Int64Counter(
+		notificationDeletedMetricName,
+		metric.WithDescription("Pending notifications evicted because the notification queue reached its limit"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	subscriberDroppedNotifyCount, err := provider.Meter(notificationMeterName).Int64Counter(
+		notificationDroppedMetricName,
+		metric.WithDescription("Notifications dropped because a subscriber channel was full"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	notifySentCount, err := provider.Meter(notificationMeterName).Int64Counter(
+		notificationSentMetricName,
+		metric.WithDescription("Notifications successfully sent by batched pg_notify"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &notificationMetrics{
+		notifyDeletedCount:           notifyDeletedCount,
+		subscriberDroppedNotifyCount: subscriberDroppedNotifyCount,
+		notifySentCount:              notifySentCount,
+	}, nil
+}
+
+func (m *notificationMetrics) recordDeleted(ctx context.Context, bufferFrom notificationBuffer, count int64) {
+	if m == nil || m.notifyDeletedCount == nil || count == 0 {
+		return
+	}
+	m.notifyDeletedCount.Add(ctx, count, metric.WithAttributes(attribute.String("buffer_from", string(bufferFrom))))
+}
+
+func (m *notificationMetrics) recordSubscriberDropped(ctx context.Context, bufferFrom notificationBuffer, count int64) {
+	if m == nil || m.subscriberDroppedNotifyCount == nil || count == 0 {
+		return
+	}
+	m.subscriberDroppedNotifyCount.Add(ctx, count, metric.WithAttributes(attribute.String("buffer_from", string(bufferFrom))))
+}
+
+func (m *notificationMetrics) recordSent(ctx context.Context, bufferFrom notificationBuffer, count int64) {
+	if m == nil || m.notifySentCount == nil || count == 0 {
+		return
+	}
+	m.notifySentCount.Add(ctx, count, metric.WithAttributes(attribute.String("buffer_from", string(bufferFrom))))
+}
+
+// NewNotificationConfig creates a notification config, normalizing invalid values.
+func NewNotificationConfig(bufferLimit int, retryMinBackoff, retryMaxBackoff time.Duration, watchBufferSize, batchSize int) NotificationConfig {
+	if bufferLimit < defaultNotificationBufferSize {
+		bufferLimit = defaultNotificationBufferSize
+	}
+	if retryMinBackoff <= 0 {
+		retryMinBackoff = notifyRetryMinBackoff
+	}
+	if retryMaxBackoff <= 0 {
+		retryMaxBackoff = notifyRetryMaxBackoff
+	}
+	if retryMaxBackoff < retryMinBackoff {
+		retryMinBackoff = notifyRetryMinBackoff
+		retryMaxBackoff = notifyRetryMaxBackoff
+	}
+	if watchBufferSize <= 0 {
+		watchBufferSize = defaultWatchBufferSize
+	}
+	if batchSize <= 0 {
+		batchSize = defaultNotifyBatchSize
+	}
+	if batchSize > maxNotifyBatchSize {
+		batchSize = maxNotifyBatchSize
+	}
+
+	return NotificationConfig{
+		bufferLimit:     bufferLimit,
+		retryMinBackoff: retryMinBackoff,
+		retryMaxBackoff: retryMaxBackoff,
+		watchBufferSize: watchBufferSize,
+		batchSize:       batchSize,
+	}
+}
+
+// actionRepo implements actionRepo interface using PostgreSQL
+type actionRepo struct {
+	db       *sqlx.DB
+	dsn      string // stored for pq.Listener
+	listener *pq.Listener
+
+	// Idle ping interval and pq's first reconnect delay; zero means the defaults above.
+	listenerPingInterval         time.Duration
+	listenerMinReconnectInterval time.Duration
+
+	// Subscriber management for LISTEN/NOTIFY
+	runSubscribers    map[*subscription]struct{}
+	actionSubscribers map[*subscription]struct{}
+	mu                sync.RWMutex
+
+	notifyMu            sync.Mutex
+	pendingActions      map[string]struct{}
+	pendingActionQueue  []string
+	pendingRuns         map[string]struct{}
+	pendingRunQueue     []string
+	pendingCh           chan struct{}
+	notificationConfig  NotificationConfig
+	notificationMetrics *notificationMetrics
+}
+
+// NewActionRepo creates a new PostgreSQL repository
+func NewActionRepo(
+	db *sqlx.DB,
+	dbConfig database.DbConfig,
+	notificationConfig NotificationConfig,
+	meterProviders ...metric.MeterProvider,
+) (interfaces.ActionRepo, error) {
+	var meterProvider metric.MeterProvider
+	if len(meterProviders) > 0 {
+		meterProvider = meterProviders[0]
+	}
+	notificationMetrics, err := newNotificationMetrics(meterProvider)
+	if err != nil {
+		return nil, fmt.Errorf("register notification metrics: %w", err)
+	}
+
+	dsn := database.GetPostgresDsn(context.Background(), dbConfig.Postgres)
+	repo := &actionRepo{
+		db:                  db,
+		dsn:                 dsn,
+		runSubscribers:      make(map[*subscription]struct{}),
+		actionSubscribers:   make(map[*subscription]struct{}),
+		notificationConfig:  notificationConfig,
+		notificationMetrics: notificationMetrics,
+	}
+
+	repo.pendingActions = make(map[string]struct{}, defaultNotificationBufferSize)
+	repo.pendingActionQueue = make([]string, 0, defaultNotificationBufferSize)
+	repo.pendingRuns = make(map[string]struct{}, defaultNotificationBufferSize)
+	repo.pendingRunQueue = make([]string, 0, defaultNotificationBufferSize)
+	repo.pendingCh = make(chan struct{}, 1)
+
+	if err := repo.startPostgresListener(); err != nil {
+		return nil, fmt.Errorf("failed to start postgres listener: %w", err)
+	}
+	if err := repo.startNotifyLoop(); err != nil {
+		return nil, fmt.Errorf("failed to start notify loop: %w", err)
+	}
+
+	return repo, nil
+}
+
+// GetRun retrieves a run by identifier
+func (r *actionRepo) GetRun(ctx context.Context, runID *common.RunIdentifier) (*models.Run, error) {
+	var run models.Run
+	err := sqlx.GetContext(ctx, r.db, &run,
+		"SELECT * FROM actions WHERE project = $1 AND domain = $2 AND run_name = $3 AND parent_action_name IS NULL",
+		runID.Project, runID.Domain, runID.Name)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("run not found: %s/%s/%s",
+				runID.Project, runID.Domain, runID.Name)
+		}
+		return nil, fmt.Errorf("failed to get run: %w", err)
+	}
+
+	return &run, nil
+}
+
+// AbortRun marks only the root action as ABORTED and sets abort_requested_at on it.
+// K8s cascades CRD deletion to child actions via OwnerReferences; the action service
+// informer handles marking them ABORTED in DB when their CRDs are deleted.
+func (r *actionRepo) AbortRun(ctx context.Context, runID *common.RunIdentifier, reason string, abortedBy *common.EnrichedIdentity) error {
+	now := time.Now()
+
+	var rootName string
+	err := r.db.QueryRowxContext(ctx,
+		`UPDATE actions SET phase = $1, updated_at = $2, abort_requested_at = $3, abort_attempt_count = $4, abort_reason = $5,
+		                    ended_at = COALESCE(ended_at, GREATEST($2, created_at)),
+		                    duration_ms = EXTRACT(EPOCH FROM (COALESCE(ended_at, GREATEST($2, created_at)) - created_at)) * 1000
+		 WHERE project = $6 AND domain = $7 AND run_name = $8 AND parent_action_name IS NULL
+		 RETURNING name`,
+		int32(common.ActionPhase_ACTION_PHASE_ABORTED), now, now, 0, reason,
+		runID.Project, runID.Domain, runID.Name,
+	).Scan(&rootName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("run not found: %w", sql.ErrNoRows)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to abort run: %w", err)
+	}
+
+	rootID := &common.ActionIdentifier{Run: runID, Name: rootName}
+	r.notifyRunUpdate(ctx, runID)
+	r.notifyActionUpdate(ctx, rootID)
+
+	logger.Infof(ctx, "Aborted run: %s/%s/%s", runID.Project, runID.Domain, runID.Name)
+	return nil
+}
+
+// InsertEvents inserts a batch of action events, ignoring duplicates (same PK = idempotent).
+func (r *actionRepo) InsertEvents(ctx context.Context, events []*models.ActionEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Multi-row INSERT so a batch of events costs one commit per chunk instead of one
+	// per event. Chunked because callers are not all bounded: the executor's batcher
+	// flushes <=400 events, but RecordActionEvents accepts arbitrary counts and
+	// Postgres caps a statement at 65,535 bind parameters (9 per row here). Chunks
+	// are inserted independently — same non-transactional semantics as the previous
+	// per-row loop, and ON CONFLICT DO NOTHING keeps retries idempotent.
+	const colsPerRow = 9
+	const chunkRows = 5000 // 45,000 params, well under the 65,535 cap
+	for start := 0; start < len(events); start += chunkRows {
+		chunk := events[start:min(start+chunkRows, len(events))]
+		valueGroups := make([]string, 0, len(chunk))
+		args := make([]any, 0, len(chunk)*colsPerRow)
+		for i, e := range chunk {
+			b := i * colsPerRow
+			valueGroups = append(valueGroups, fmt.Sprintf(
+				"($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+				b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9))
+			args = append(args, e.Project, e.Domain, e.RunName, e.Name, e.Attempt, e.Phase, e.Version, e.Info, e.ErrorKind)
+		}
+		query := `INSERT INTO action_events (project, domain, run_name, name, attempt, phase, version, info, error_kind, created_at, updated_at) VALUES ` +
+			strings.Join(valueGroups, ", ") + ` ON CONFLICT DO NOTHING`
+		if _, err := r.db.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("insert action_events chunk start=%d size=%d: %w", start, len(chunk), err)
+		}
+	}
+
+	// Notify subscribers so watchers see new events (e.g. log context becoming available).
+	notified := make(map[string]bool)
+	for _, e := range events {
+		actionID := &common.ActionIdentifier{
+			Run: &common.RunIdentifier{
+				Project: e.Project,
+				Domain:  e.Domain,
+				Name:    e.RunName,
+			},
+			Name: e.Name,
+		}
+		key := e.Project + "/" + e.Domain + "/" + e.RunName + "/" + e.Name
+		if !notified[key] {
+			r.notifyActionUpdate(ctx, actionID)
+			notified[key] = true
+		}
+	}
+	return nil
+}
+
+// ListEvents lists action events for a given action identifier.
+func (r *actionRepo) ListEvents(ctx context.Context, actionID *common.ActionIdentifier, limit int) ([]*models.ActionEvent, error) {
+	var events []*models.ActionEvent
+	err := sqlx.SelectContext(ctx, r.db, &events,
+		`SELECT * FROM action_events
+		 WHERE project = $1 AND domain = $2 AND run_name = $3 AND name = $4
+		 ORDER BY attempt ASC, phase ASC, version ASC
+		 LIMIT $5`,
+		actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list action events: %w", err)
+	}
+	return events, nil
+}
+
+// ListEventsSince lists action events for a given action identifier updated at or after the provided checkpoint.
+func (r *actionRepo) ListEventsSince(
+	ctx context.Context,
+	actionID *common.ActionIdentifier,
+	attempt uint32,
+	since time.Time,
+	offset, limit int,
+) ([]*models.ActionEvent, error) {
+	var events []*models.ActionEvent
+	err := sqlx.SelectContext(ctx, r.db, &events,
+		`SELECT * FROM action_events
+		 WHERE project = $1 AND domain = $2 AND run_name = $3 AND name = $4 AND attempt = $5 AND updated_at > $6
+		 ORDER BY updated_at ASC, attempt ASC, phase ASC, version ASC
+		 OFFSET $7 LIMIT $8`,
+		actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name, attempt, since,
+		offset, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list action events since %s: %w", since.Format(time.RFC3339Nano), err)
+	}
+	return events, nil
+}
+
+// GetLatestEventByAttempt returns the most recent event for a given attempt,
+// ordered by version descending, without deserializing all events.
+func (r *actionRepo) GetLatestEventByAttempt(ctx context.Context, actionID *common.ActionIdentifier, attempt uint32) (*models.ActionEvent, error) {
+	var event models.ActionEvent
+	err := sqlx.GetContext(ctx, r.db, &event,
+		`SELECT * FROM action_events
+		 WHERE project = $1 AND domain = $2 AND run_name = $3 AND name = $4 AND attempt = $5
+		 ORDER BY phase DESC, version DESC
+		 LIMIT 1`,
+		actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name, attempt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("event not found for attempt %d: %w", attempt, sql.ErrNoRows)
+		}
+		return nil, fmt.Errorf("failed to get latest event for attempt %d: %w", attempt, err)
+	}
+	return &event, nil
+}
+
+// CreateAction inserts an Action model and promotes its parent to RUNNING in the
+// same transaction only from QUEUED, INITIALIZING, or WAITING_FOR_RESOURCES.
+// When updateTriggeredAt is true and the action has a TriggerName set, triggered_at on the
+// corresponding trigger row is updated to now() in the same transaction.
+func (r *actionRepo) CreateAction(ctx context.Context, action *models.Action, updateTriggeredAt bool) (*models.Action, error) {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Use the model's CreatedAt if set (e.g. trace actions use start_time so parents
+	// sort before children), otherwise fall back to the current time.
+	createdAt := action.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+
+	result, err := tx.ExecContext(ctx,
+		`INSERT INTO actions (project, domain, run_name, name, parent_action_name, phase, run_source, action_type, action_group, task_project, task_domain, task_name, task_version, task_type, task_short_name, function_name, environment_name, action_spec, action_details, detailed_info, run_spec, attempts, cache_status, trigger_name, trigger_task_name, trigger_revision, created_at, ended_at, created_by, created_by_subject, labels, duration_ms)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, CASE WHEN $28::timestamptz IS NOT NULL THEN EXTRACT(EPOCH FROM (GREATEST($28::timestamptz, $27) - $27)) * 1000 ELSE NULL END)
+		 ON CONFLICT DO NOTHING`,
+		action.Project, action.Domain, action.RunName, action.Name, action.ParentActionName, action.Phase, action.RunSource, action.ActionType, action.ActionGroup,
+		action.TaskProject, action.TaskDomain, action.TaskName, action.TaskVersion, action.TaskType, action.TaskShortName, action.FunctionName, action.EnvironmentName,
+		action.ActionSpec, action.ActionDetails, action.DetailedInfo, action.RunSpec, action.Attempts, action.CacheStatus,
+		action.TriggerName, action.TriggerTaskName, action.TriggerRevision, createdAt, action.EndedAt, action.CreatedBy, action.CreatedBySubject, action.Labels)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create action: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected > 0 && updateTriggeredAt && action.TriggerName.Valid {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE triggers SET triggered_at = NOW() WHERE project = $1 AND domain = $2 AND task_name = $3 AND name = $4`,
+			action.Project, action.Domain, action.TriggerTaskName.String, action.TriggerName.String,
+		); err != nil {
+			return nil, fmt.Errorf("failed to update triggered_at: %w", err)
+		}
+	}
+
+	// Creating a child proves its parent started executing. Check and update
+	// the parent in one statement so a concurrent terminal update cannot be
+	// overwritten by this inferred RUNNING status.
+	var parentUpdated bool
+	if rowsAffected > 0 && action.ParentActionName.Valid && action.ParentActionName.String != "" {
+		result, err := tx.ExecContext(ctx,
+			`UPDATE actions SET phase = $5, updated_at = NOW()
+			 WHERE project = $1 AND domain = $2 AND run_name = $3 AND name = $4
+			 AND phase = ANY($6)`,
+			action.Project, action.Domain, action.RunName, action.ParentActionName.String,
+			int32(common.ActionPhase_ACTION_PHASE_RUNNING),
+			pq.Array([]int32{
+				int32(common.ActionPhase_ACTION_PHASE_QUEUED),
+				int32(common.ActionPhase_ACTION_PHASE_WAITING_FOR_RESOURCES),
+				int32(common.ActionPhase_ACTION_PHASE_INITIALIZING),
+			}))
+		if err != nil {
+			return nil, fmt.Errorf("failed to promote parent action: %w", err)
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get parent update count: %w", err)
+		}
+		parentUpdated = updated > 0
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit tx: %w", err)
+	}
+
+	actionID := &common.ActionIdentifier{
+		Name: action.Name,
+		Run: &common.RunIdentifier{
+			Project: action.Project,
+			Domain:  action.Domain,
+			Name:    action.RunName,
+		},
+	}
+
+	if parentUpdated {
+		r.notifyActionUpdate(ctx, &common.ActionIdentifier{
+			Run: actionID.Run, Name: action.ParentActionName.String,
+		})
+	}
+
+	// If no rows were affected, the action already exists — fetch and return it.
+	if rowsAffected == 0 {
+		existing, err := r.GetAction(ctx, actionID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get existing action: %w", err)
+		}
+		return existing, nil
+	}
+
+	// Fetch the created action to get DB-generated fields (created_at, updated_at)
+	created, err := r.GetAction(ctx, actionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch created action: %w", err)
+	}
+
+	logger.Infof(ctx, "Created action: %s", created.Name)
+
+	// Notify subscribers of action creation
+	r.notifyActionUpdate(ctx, actionID)
+
+	return created, nil
+}
+
+// GetAction retrieves an action by identifier
+func (r *actionRepo) GetAction(ctx context.Context, actionID *common.ActionIdentifier) (*models.Action, error) {
+	var action models.Action
+	err := sqlx.GetContext(ctx, r.db, &action,
+		"SELECT * FROM actions WHERE project = $1 AND domain = $2 AND run_name = $3 AND name = $4",
+		actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("action not found")
+		}
+		return nil, fmt.Errorf("failed to get action: %w", err)
+	}
+
+	return &action, nil
+}
+
+// ListActions lists actions matching the given input filter, sort, and pagination.
+func (r *actionRepo) ListActions(ctx context.Context, input interfaces.ListResourceInput) ([]*models.Action, error) {
+	// ListActions supports two mutually-exclusive pagination modes: keyset (KeysetAfter,
+	// the ascending (created_at, name) keyset used by the WatchActions snapshot) and offset
+	// (Offset, used by the ListRuns/ListActions RPC — the page token is the running offset).
+	if input.Offset < 0 {
+		return nil, fmt.Errorf("offset must be non-negative")
+	}
+	if input.Offset > 0 && input.KeysetAfterCreatedAt != nil {
+		return nil, fmt.Errorf("offset is mutually exclusive with keysetAfter")
+	}
+	if input.KeysetAfterCreatedAt == nil && input.KeysetAfterName != "" {
+		// The keyset WHERE only runs when KeysetAfterCreatedAt is set; a name on its own
+		// would be silently ignored (paging from the start). Reject it so the mistake is
+		// caught instead of returning wrong pages.
+		return nil, fmt.Errorf("keysetAfterName requires keysetAfterCreatedAt")
+	}
+	if input.KeysetAfterCreatedAt != nil {
+		if input.KeysetAfterName == "" {
+			return nil, fmt.Errorf("keysetAfter requires keysetAfterName")
+		}
+		// The keyset WHERE `(created_at, name) > (?, ?)` is only correct when the query
+		// is ordered by exactly (created_at ASC, name ASC); any other sort would skip or
+		// duplicate rows across pages.
+		if len(input.SortParameters) != 2 ||
+			input.SortParameters[0].GetOrderExpr() != "created_at ASC" ||
+			input.SortParameters[1].GetOrderExpr() != "name ASC" {
+			return nil, fmt.Errorf("keysetAfter requires sortParameters (created_at ASC, name ASC)")
+		}
+	}
+
+	var queryBuilder strings.Builder
+	var args []interface{}
+
+	queryBuilder.WriteString("SELECT * FROM actions")
+
+	if input.Filter != nil {
+		expr, err := input.Filter.QueryExpression("")
+		if err != nil {
+			return nil, fmt.Errorf("failed to build filter expression: %w", err)
+		}
+		queryBuilder.WriteString(" WHERE ")
+		queryBuilder.WriteString(expr.Query)
+		args = append(args, expr.Args...)
+	}
+
+	if input.KeysetAfterCreatedAt != nil {
+		// Ascending composite keyset: return rows strictly after (created_at, name).
+		// Postgres row-value comparison implements the lexicographic keyset:
+		// (created_at, name) > (c, n)  <=>  created_at > c OR (created_at = c AND name > n).
+		// Backed by idx_actions_run_created_name so each page is an index range-scan.
+		if input.Filter != nil {
+			queryBuilder.WriteString(" AND (created_at, name) > (?, ?)")
+		} else {
+			queryBuilder.WriteString(" WHERE (created_at, name) > (?, ?)")
+		}
+		args = append(args, *input.KeysetAfterCreatedAt, input.KeysetAfterName)
+	}
+
+	if len(input.SortParameters) > 0 {
+		queryBuilder.WriteString(" ORDER BY ")
+		sortCols := make(map[string]bool, len(input.SortParameters))
+		for i, sp := range input.SortParameters {
+			if i > 0 {
+				queryBuilder.WriteString(", ")
+			}
+			expr := sp.GetOrderExpr()
+			queryBuilder.WriteString(expr)
+			if fields := strings.Fields(expr); len(fields) > 0 {
+				sortCols[fields[0]] = true
+			}
+		}
+		// A client-supplied sort may not be a total order (e.g. created_at DESC with the
+		// tied timestamps of bulk-created map-task children); Postgres then leaves ties in
+		// an arbitrary order, so OFFSET pages can skip/duplicate rows. Append (run_name,
+		// name) — unique per row (part of the PK) — as deterministic tiebreakers so paging
+		// is stable. The keyset snapshot path already orders by exactly (created_at ASC,
+		// name ASC), which is a total order within a run, so leave it untouched.
+		if input.KeysetAfterCreatedAt == nil {
+			if !sortCols["run_name"] {
+				queryBuilder.WriteString(", run_name ASC")
+			}
+			if !sortCols["name"] {
+				queryBuilder.WriteString(", name ASC")
+			}
+		}
+	} else {
+		// Default sorting non-terminal runs at the top, then by most recent start time.
+		// (run_name, name) is a deterministic tiebreaker (part of the PK) so the order is
+		// total and offset pagination is stable (rows don't shuffle between pages).
+		queryBuilder.WriteString(" ORDER BY phase ASC, created_at DESC, run_name DESC, name DESC")
+	}
+
+	queryBuilder.WriteString(" LIMIT ?")
+	args = append(args, input.Limit+1)
+
+	if input.Offset > 0 {
+		queryBuilder.WriteString(" OFFSET ?")
+		args = append(args, input.Offset)
+	}
+
+	query := sqlx.Rebind(sqlx.DOLLAR, queryBuilder.String())
+
+	var actions []*models.Action
+	if err := sqlx.SelectContext(ctx, r.db, &actions, query, args...); err != nil {
+		return nil, fmt.Errorf("failed to list actions: %w", err)
+	}
+
+	return actions, nil
+}
+
+// UpdateActionPhase updates the phase of an action.
+// endTime should be set when the action reaches a terminal phase.
+func (r *actionRepo) UpdateActionPhase(
+	ctx context.Context,
+	actionID *common.ActionIdentifier,
+	phase common.ActionPhase,
+	attempts uint32,
+	cacheStatus core.CatalogCacheStatus,
+	endTime *time.Time,
+	startTime *time.Time,
+) error {
+	now := time.Now()
+	retryablePhases := []int32{
+		int32(common.ActionPhase_ACTION_PHASE_FAILED),
+		int32(common.ActionPhase_ACTION_PHASE_TIMED_OUT),
+	}
+
+	var queryBuilder strings.Builder
+	var args []interface{}
+	argIdx := 1
+
+	queryBuilder.WriteString("UPDATE actions SET ")
+	queryBuilder.WriteString(fmt.Sprintf("phase = $%d, attempts = $%d, cache_status = $%d, updated_at = $%d", argIdx, argIdx+1, argIdx+2, argIdx+3)) //nolint: staticcheck
+	args = append(args, phase, attempts, cacheStatus, now)
+	argIdx += 4
+
+	startExpr := "created_at"
+	if startTime != nil {
+		startExpr = fmt.Sprintf("LEAST(created_at, $%d)", argIdx)
+		queryBuilder.WriteString(fmt.Sprintf(", created_at = %s", startExpr)) //nolint: staticcheck
+		args = append(args, *startTime)
+		argIdx++
+	}
+
+	if endTime != nil {
+		queryBuilder.WriteString(fmt.Sprintf(", ended_at = COALESCE(ended_at, GREATEST($%d, %s))", argIdx, startExpr)) //nolint: staticcheck
+		args = append(args, *endTime)
+		argIdx++
+		queryBuilder.WriteString(fmt.Sprintf(", duration_ms = EXTRACT(EPOCH FROM (COALESCE(ended_at, GREATEST($%d, %s)) - %s)) * 1000", argIdx, startExpr, startExpr)) //nolint: staticcheck
+		args = append(args, *endTime)
+		argIdx++
+	}
+
+	queryBuilder.WriteString(fmt.Sprintf(" WHERE project = $%d AND domain = $%d AND run_name = $%d AND name = $%d AND (phase <= $%d OR phase = ANY($%d) OR (phase = $%d AND $%d = ANY($%d)))", //nolint: staticcheck
+		argIdx, argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5, argIdx+6, argIdx+4, argIdx+7))
+	args = append(args, actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name, phase,
+		pq.Array(retryablePhases), int32(common.ActionPhase_ACTION_PHASE_PAUSED), pq.Array(terminalPhases))
+
+	result, err := r.db.ExecContext(ctx, queryBuilder.String(), args...)
+	if err != nil {
+		return err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected > 0 {
+		r.notifyActionUpdate(ctx, actionID)
+	}
+
+	// If this is the root action (the run itself), also notify run subscribers
+	// so that WatchRuns streams reflect phase transitions (e.g. RUNNING → SUCCEEDED).
+	if actionID.Name == rootActionName {
+		r.notifyRunUpdate(ctx, actionID.Run)
+	}
+
+	return nil
+}
+
+// UpdateActionDetailedInfo replaces the serialized RunInfo (detailed_info column).
+func (r *actionRepo) UpdateActionDetailedInfo(ctx context.Context, actionID *common.ActionIdentifier, detailedInfo []byte) error {
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE actions SET detailed_info = $1, updated_at = $2
+		 WHERE project = $3 AND domain = $4 AND run_name = $5 AND name = $6`,
+		detailedInfo, time.Now(),
+		actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return sql.ErrNoRows
+	}
+	r.notifyActionUpdate(ctx, actionID)
+	return nil
+}
+
+// AbortAction marks only the targeted action as ABORTED and sets abort_requested_at.
+// K8s cascades CRD deletion to descendants via OwnerReferences; the action service
+// informer handles marking them ABORTED in DB when their CRDs are deleted.
+func (r *actionRepo) AbortAction(ctx context.Context, actionID *common.ActionIdentifier, reason string, abortedBy *common.EnrichedIdentity) error {
+	now := time.Now()
+
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE actions SET phase = $1, updated_at = $2, abort_requested_at = $3, abort_attempt_count = $4, abort_reason = $5,
+		                    ended_at = COALESCE(ended_at, GREATEST($2, created_at)),
+		                    duration_ms = EXTRACT(EPOCH FROM (COALESCE(ended_at, GREATEST($2, created_at)) - created_at)) * 1000
+		 WHERE project = $6 AND domain = $7 AND run_name = $8 AND name = $9`,
+		int32(common.ActionPhase_ACTION_PHASE_ABORTED), now, now, 0, reason,
+		actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name)
+	if err != nil {
+		return fmt.Errorf("failed to abort action: %w", err)
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return fmt.Errorf("action not found: %w", sql.ErrNoRows)
+	}
+
+	r.notifyActionUpdate(ctx, actionID)
+
+	logger.Infof(ctx, "AbortAction: aborted %s", actionID.Name)
+	return nil
+}
+
+// ListPendingAborts returns all actions that have abort_requested_at set (i.e. awaiting pod termination).
+func (r *actionRepo) ListPendingAborts(ctx context.Context) ([]*models.Action, error) {
+	var actions []*models.Action
+	err := sqlx.SelectContext(ctx, r.db, &actions,
+		"SELECT * FROM actions WHERE abort_requested_at IS NOT NULL")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pending aborts: %w", err)
+	}
+	return actions, nil
+}
+
+// MarkAbortAttempt increments abort_attempt_count and returns the new value.
+// Called by the reconciler before each actionsClient.Abort call.
+func (r *actionRepo) MarkAbortAttempt(ctx context.Context, actionID *common.ActionIdentifier) (int, error) {
+	var abortAttemptCount int
+	err := r.db.QueryRowxContext(ctx,
+		`UPDATE actions SET abort_attempt_count = abort_attempt_count + 1, updated_at = $1
+		 WHERE project = $2 AND domain = $3 AND run_name = $4 AND name = $5
+		 RETURNING abort_attempt_count`,
+		time.Now(), actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name,
+	).Scan(&abortAttemptCount)
+	if err != nil {
+		return 0, fmt.Errorf("failed to mark abort attempt: %w", err)
+	}
+	return abortAttemptCount, nil
+}
+
+// ClearAbortRequest clears abort_requested_at (and resets counters) once the pod is confirmed terminated.
+func (r *actionRepo) ClearAbortRequest(ctx context.Context, actionID *common.ActionIdentifier) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE actions SET abort_requested_at = NULL, abort_attempt_count = 0, updated_at = $1
+		 WHERE project = $2 AND domain = $3 AND run_name = $4 AND name = $5`,
+		time.Now(), actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name)
+	if err != nil {
+		return fmt.Errorf("failed to clear abort request: %w", err)
+	}
+	return nil
+}
+
+// UpdateActionState updates the state of an action
+func (r *actionRepo) UpdateActionState(ctx context.Context, actionID *common.ActionIdentifier, state string) error {
+	// Parse the state JSON to extract the phase
+	var stateObj map[string]interface{}
+	if err := json.Unmarshal([]byte(state), &stateObj); err != nil {
+		return fmt.Errorf("failed to unmarshal state JSON: %w", err)
+	}
+
+	now := time.Now()
+
+	// Extract phase if present
+	var phase interface{}
+	if p, ok := stateObj["phase"].(string); ok {
+		phase = p
+		logger.Infof(ctx, "Updating action %s phase to %s", actionID.Name, p)
+	}
+
+	var result sql.Result
+	var err error
+	if phase != nil {
+		result, err = r.db.ExecContext(ctx,
+			`UPDATE actions SET phase = $1, action_details = $2, updated_at = $3
+			 WHERE project = $4 AND domain = $5 AND run_name = $6 AND name = $7`,
+			phase, []byte(state), now,
+			actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name)
+	} else {
+		result, err = r.db.ExecContext(ctx,
+			`UPDATE actions SET action_details = $1, updated_at = $2
+			 WHERE project = $3 AND domain = $4 AND run_name = $5 AND name = $6`,
+			[]byte(state), now,
+			actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to update action state: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("action not found: %s/%s/%s/%s",
+			actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name)
+	}
+
+	// Notify subscribers of the update
+	r.notifyActionUpdate(ctx, actionID)
+
+	return nil
+}
+
+// GetActionState retrieves the state of an action
+func (r *actionRepo) GetActionState(ctx context.Context, actionID *common.ActionIdentifier) (string, error) {
+	var actionDetails []byte
+	err := r.db.QueryRowContext(ctx,
+		"SELECT action_details FROM actions WHERE project = $1 AND domain = $2 AND run_name = $3 AND name = $4",
+		actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name,
+	).Scan(&actionDetails)
+	if err != nil {
+		return "", fmt.Errorf("failed to get action state: %w", err)
+	}
+
+	return string(actionDetails), nil
+}
+
+// NotifyStateUpdate sends a notification about a state update
+func (r *actionRepo) NotifyStateUpdate(ctx context.Context, actionID *common.ActionIdentifier) error {
+	// This is already handled by notifyActionUpdate
+	r.notifyActionUpdate(ctx, actionID)
+	return nil
+}
+
+// WatchStateUpdates watches for state updates (simplified implementation)
+func (r *actionRepo) WatchStateUpdates(ctx context.Context, updates chan<- *common.ActionIdentifier, errs chan<- error) {
+	// For now, just block until context is cancelled
+	// In a full implementation, this would listen for state notifications
+	<-ctx.Done()
+}
+
+// subscription is one Watch* subscriber.
+type subscription struct {
+	notify chan string
+	// resync asks the subscriber to re-read its state from the DB after the listener reconnects.
+	resync chan struct{}
+}
+
+// requestResync never blocks, and repeated requests coalesce into one re-read.
+func (s *subscription) requestResync() {
+	select {
+	case s.resync <- struct{}{}:
+	default:
+	}
+}
+
+func (r *actionRepo) subscribe(subs map[*subscription]struct{}) *subscription {
+	sub := &subscription{
+		notify: make(chan string, r.notificationConfig.watchBufferSize),
+		resync: make(chan struct{}, 1),
+	}
+	r.mu.Lock()
+	subs[sub] = struct{}{}
+	r.mu.Unlock()
+	return sub
+}
+
+func (r *actionRepo) unsubscribe(subs map[*subscription]struct{}, sub *subscription) {
+	r.mu.Lock()
+	delete(subs, sub)
+	close(sub.notify)
+	r.mu.Unlock()
+}
+
+// WatchRunUpdates watches for run updates via LISTEN/NOTIFY
+func (r *actionRepo) WatchRunUpdates(ctx context.Context, runID *common.RunIdentifier, updates chan<- *models.Run, errs chan<- error) {
+	runKey := fmt.Sprintf("%s/%s/%s", runID.Project, runID.Domain, runID.Name)
+	sub := r.subscribe(r.runSubscribers)
+	defer r.unsubscribe(r.runSubscribers, sub)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sub.resync:
+		case notifPayload := <-sub.notify:
+			if notifPayload != runKey {
+				continue
+			}
+		}
+
+		run, err := r.GetRun(ctx, runID)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			errs <- err
+			return
+		}
+		select {
+		case updates <- run:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// WatchAllRunUpdates watches for all run updates via LISTEN/NOTIFY
+func (r *actionRepo) WatchAllRunUpdates(ctx context.Context, updates chan<- *models.Run, errs chan<- error) {
+	sub := r.subscribe(r.runSubscribers)
+	defer r.unsubscribe(r.runSubscribers, sub)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sub.resync:
+			select {
+			case updates <- nil:
+			case <-ctx.Done():
+				return
+			}
+		case notifPayload := <-sub.notify:
+			parts := strings.Split(notifPayload, "/")
+			if len(parts) != 3 {
+				logger.Warnf(ctx, "Invalid run notification payload: %s", notifPayload)
+				continue
+			}
+
+			runID := &common.RunIdentifier{
+				Project: parts[0],
+				Domain:  parts[1],
+				Name:    parts[2],
+			}
+
+			if ctx.Err() != nil {
+				return
+			}
+			run, err := r.GetRun(ctx, runID)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				logger.Errorf(ctx, "Failed to get run from notification: %v", err)
+				continue
+			}
+			select {
+			case updates <- run:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// WatchAllActionUpdates watches for all action updates for a run via LISTEN/NOTIFY
+func (r *actionRepo) WatchAllActionUpdates(ctx context.Context, runID *common.RunIdentifier, updates chan<- *models.Action, errs chan<- error) {
+	runPrefix := fmt.Sprintf("%s/%s/%s/", runID.Project, runID.Domain, runID.Name)
+	sub := r.subscribe(r.actionSubscribers)
+	defer r.unsubscribe(r.actionSubscribers, sub)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sub.resync:
+			select {
+			case updates <- nil:
+			case <-ctx.Done():
+				return
+			}
+		case notifPayload := <-sub.notify:
+			// Collect this notification plus any others already queued,
+			// deduplicating by action name so we only query the DB once
+			// per action during a burst of updates.
+			pending := make(map[string]bool)
+			if len(notifPayload) > len(runPrefix) && notifPayload[:len(runPrefix)] == runPrefix {
+				pending[notifPayload[len(runPrefix):]] = true
+			}
+			// Drain buffered notifications without blocking.
+		drain:
+			for {
+				select {
+				case extra := <-sub.notify:
+					if len(extra) > len(runPrefix) && extra[:len(runPrefix)] == runPrefix {
+						pending[extra[len(runPrefix):]] = true
+					}
+				default:
+					break drain
+				}
+			}
+
+			for actionName := range pending {
+				actionID := &common.ActionIdentifier{
+					Run:  runID,
+					Name: actionName,
+				}
+				if ctx.Err() != nil {
+					return
+				}
+				action, err := r.GetAction(ctx, actionID)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					logger.Errorf(ctx, "Failed to get action from notification: %v", err)
+					continue
+				}
+				select {
+				case updates <- action:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}
+}
+
+// WatchActionUpdates watches the current action update via LISTEN/NOTIFY
+func (r *actionRepo) WatchActionUpdates(ctx context.Context, actionID *common.ActionIdentifier, updates chan<- *models.Action, errs chan<- error) {
+	targetPayload := fmt.Sprintf("%s/%s/%s/%s",
+		actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name)
+	sub := r.subscribe(r.actionSubscribers)
+	defer r.unsubscribe(r.actionSubscribers, sub)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sub.resync:
+		case notifPayload := <-sub.notify:
+			if notifPayload != targetPayload {
+				continue
+			}
+
+		drain:
+			for {
+				// Prevent continuous update from the action
+				select {
+				case extra := <-sub.notify:
+					if extra != targetPayload {
+						continue
+					}
+				default:
+					break drain
+				}
+			}
+		}
+
+		action, err := r.GetAction(ctx, actionID)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			logger.Errorf(ctx, "Failed to get action from notification: %v", err)
+			continue
+		}
+
+		select {
+		case updates <- action:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// startPostgresListener starts the PostgreSQL LISTEN/NOTIFY listener.
+// Returns an error if the connection or LISTEN setup fails.
+func (r *actionRepo) startPostgresListener() error {
+	connStr := r.dsn
+
+	minReconnectInterval := r.listenerMinReconnectInterval
+	if minReconnectInterval <= 0 {
+		minReconnectInterval = defaultListenerMinReconnectInterval
+	}
+
+	r.listener = pq.NewListener(connStr, minReconnectInterval, time.Minute, func(ev pq.ListenerEventType, err error) {
+		if err != nil {
+			logger.Errorf(context.Background(), "Listener error: %v", err)
+		}
+	})
+
+	// Listen to channels
+	if err := r.listener.Listen("run_updates"); err != nil {
+		return fmt.Errorf("listen to run_updates: %w", err)
+	}
+
+	if err := r.listener.Listen("action_updates"); err != nil {
+		return fmt.Errorf("listen to action_updates: %w", err)
+	}
+
+	// Process notifications in background
+	go r.processNotifications()
+
+	return nil
+}
+
+// processNotifications handles incoming LISTEN/NOTIFY messages.
+func (r *actionRepo) processNotifications() {
+	logger.Infof(context.Background(), "PostgreSQL LISTEN/NOTIFY started")
+
+	pingInterval := r.listenerPingInterval
+	if pingInterval <= 0 {
+		pingInterval = defaultListenerPingInterval
+	}
+
+	// Process notifications
+	for {
+		select {
+		case notif, ok := <-r.listener.Notify:
+			if !ok {
+				// pq closes Notify only after Listener.Close().
+				logger.Infof(context.Background(), "PostgreSQL listener closed, stopping notification processing")
+				return
+			}
+			if notif == nil {
+				// pq sends nil after it reconnects; notifications sent while it was down may be lost.
+				logger.Infof(context.Background(), "PostgreSQL listener reconnected, resyncing subscribers")
+				r.mu.RLock()
+				for sub := range r.runSubscribers {
+					sub.requestResync()
+				}
+				for sub := range r.actionSubscribers {
+					sub.requestResync()
+				}
+				r.mu.RUnlock()
+				continue
+			}
+
+			switch notif.Channel {
+			case "run_updates":
+				// Broadcast to all run subscribers
+				r.mu.RLock()
+				for sub := range r.runSubscribers {
+					select {
+					case sub.notify <- notif.Extra:
+					default:
+						// Channel full, skip this subscriber
+						logger.Warnf(context.Background(), "Run subscriber channel full, dropping notification")
+						r.notificationMetrics.recordSubscriberDropped(context.Background(), notificationBufferRun, 1)
+					}
+				}
+				r.mu.RUnlock()
+
+			case "action_updates":
+				// Broadcast to all action subscribers
+				r.mu.RLock()
+				for sub := range r.actionSubscribers {
+					select {
+					case sub.notify <- notif.Extra:
+					default:
+						logger.Warnf(context.Background(), "Action subscriber channel full, dropping notification payload=%s", notif.Extra)
+						r.notificationMetrics.recordSubscriberDropped(context.Background(), notificationBufferAction, 1)
+					}
+				}
+				r.mu.RUnlock()
+
+			}
+
+		case <-time.After(pingInterval):
+			// Ping to keep connection alive. Ping fails while pq is reconnecting in the background, so keep
+			// reading Notify instead of returning; nothing would restart this goroutine.
+			if err := r.listener.Ping(); err != nil {
+				logger.Warnf(context.Background(), "Listener ping failed, waiting for reconnect: %v", err)
+			}
+		}
+	}
+}
+
+func (r *actionRepo) notifyRunUpdate(_ context.Context, runID *common.RunIdentifier) {
+	payload := fmt.Sprintf("%s/%s/%s", runID.Project, runID.Domain, runID.Name)
+	r.markRunPending(payload)
+}
+
+func (r *actionRepo) markRunPending(payload string) {
+	r.notifyMu.Lock()
+	enqueuePending(
+		r.pendingRuns, &r.pendingRunQueue, payload, r.notificationConfig.bufferLimit,
+		r.notificationMetrics, notificationBufferRun,
+	)
+	r.notifyMu.Unlock()
+	r.signalPending()
+}
+
+func (r *actionRepo) signalPending() {
+	select {
+	case r.pendingCh <- struct{}{}:
+	default:
+	}
+}
+
+func (r *actionRepo) takePendingNotifications() (actions, runs []string) {
+	r.notifyMu.Lock()
+	defer r.notifyMu.Unlock()
+
+	actions, runs = r.pendingActionQueue, r.pendingRunQueue
+	r.pendingActions = make(map[string]struct{}, defaultNotificationBufferSize)
+	r.pendingActionQueue = make([]string, 0, defaultNotificationBufferSize)
+	r.pendingRuns = make(map[string]struct{}, defaultNotificationBufferSize)
+	r.pendingRunQueue = make([]string, 0, defaultNotificationBufferSize)
+	return actions, runs
+}
+
+func (r *actionRepo) mergePendingActions(actions []string) {
+	if len(actions) == 0 {
+		return
+	}
+	r.notifyMu.Lock()
+	r.pendingActions, r.pendingActionQueue = mergePending(
+		actions, r.pendingActionQueue, r.notificationConfig.bufferLimit,
+		r.notificationMetrics, notificationBufferAction,
+	)
+	r.notifyMu.Unlock()
+}
+
+func (r *actionRepo) mergePendingRuns(runs []string) {
+	if len(runs) == 0 {
+		return
+	}
+	r.notifyMu.Lock()
+	r.pendingRuns, r.pendingRunQueue = mergePending(
+		runs, r.pendingRunQueue, r.notificationConfig.bufferLimit,
+		r.notificationMetrics, notificationBufferRun,
+	)
+	r.notifyMu.Unlock()
+}
+
+func mergePending(
+	retry, queued []string,
+	limit int,
+	metrics *notificationMetrics,
+	bufferFrom notificationBuffer,
+) (map[string]struct{}, []string) {
+	pending := make(map[string]struct{}, len(retry)+len(queued))
+	queue := make([]string, 0, len(retry)+len(queued))
+	for _, payload := range append(retry, queued...) {
+		enqueuePending(pending, &queue, payload, limit, metrics, bufferFrom)
+	}
+	return pending, queue
+}
+
+func enqueuePending(
+	pending map[string]struct{},
+	queue *[]string,
+	payload string,
+	limit int,
+	metrics *notificationMetrics,
+	bufferFrom notificationBuffer,
+) {
+	if _, exists := pending[payload]; exists {
+		return
+	}
+	if len(pending) >= limit {
+		logger.Warnf(context.Background(), "Notification buffer full, dropping buffer=%s payload=%s", bufferFrom, (*queue)[0])
+		delete(pending, (*queue)[0])
+		(*queue)[0] = ""
+		*queue = (*queue)[1:]
+		metrics.recordDeleted(context.Background(), bufferFrom, 1)
+	}
+	pending[payload] = struct{}{}
+	*queue = append(*queue, payload)
+}
+
+// ListRootActions lists root actions (runs) matching scope and date filters.
+func (r *actionRepo) ListRootActions(ctx context.Context, project, domain string, startDate, endDate *time.Time, limit int) ([]*models.Action, error) {
+	var queryBuilder strings.Builder
+	var args []interface{}
+	argIdx := 1
+
+	queryBuilder.WriteString("SELECT * FROM actions WHERE parent_action_name IS NULL")
+
+	if project != "" {
+		queryBuilder.WriteString(fmt.Sprintf(" AND project = $%d", argIdx)) //nolint: staticcheck
+		args = append(args, project)
+		argIdx++
+	}
+	if domain != "" {
+		queryBuilder.WriteString(fmt.Sprintf(" AND domain = $%d", argIdx)) //nolint: staticcheck
+		args = append(args, domain)
+		argIdx++
+	}
+	if startDate != nil {
+		queryBuilder.WriteString(fmt.Sprintf(" AND created_at >= $%d", argIdx)) //nolint: staticcheck
+		args = append(args, *startDate)
+		argIdx++
+	}
+	if endDate != nil {
+		queryBuilder.WriteString(fmt.Sprintf(" AND created_at <= $%d", argIdx)) //nolint: staticcheck
+		args = append(args, *endDate)
+		argIdx++
+	}
+	if limit <= 0 {
+		limit = 1000
+	}
+
+	queryBuilder.WriteString(fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d", argIdx)) //nolint: staticcheck
+	args = append(args, limit)
+
+	var actions []*models.Action
+	if err := sqlx.SelectContext(ctx, r.db, &actions, queryBuilder.String(), args...); err != nil {
+		return nil, fmt.Errorf("failed to list root actions: %w", err)
+	}
+	return actions, nil
+}
+
+// CountActiveActionsByPhase counts the actions in an active phase, split by phase
+// and by whether the action is a root (a run).
+func (r *actionRepo) CountActiveActionsByPhase(ctx context.Context) (map[interfaces.PhaseKey]int64, error) {
+	var rows []struct {
+		Phase  int32 `db:"phase"`
+		IsRoot bool  `db:"is_root"`
+		Count  int64 `db:"count"`
+	}
+	err := sqlx.SelectContext(ctx, r.db, &rows,
+		`SELECT phase, parent_action_name IS NULL AS is_root, COUNT(*) AS count
+		FROM actions WHERE phase = ANY($1) GROUP BY 1, 2`,
+		pq.Array(activePhases))
+	if err != nil {
+		return nil, fmt.Errorf("failed to count actions by phase: %w", err)
+	}
+	counts := make(map[interfaces.PhaseKey]int64, len(rows))
+	for _, row := range rows {
+		counts[interfaces.PhaseKey{Phase: row.Phase, IsRoot: row.IsRoot}] = row.Count
+	}
+	return counts, nil
+}
+
+// startNotifyLoop acquires a dedicated DB connection for NOTIFY commands and
+// starts processing in the background. Returns an error if the initial
+// connection cannot be established.
+func (r *actionRepo) startNotifyLoop() error {
+	sqlDB := r.db.DB
+
+	conn, err := sqlDB.Conn(context.Background())
+	if err != nil {
+		return fmt.Errorf("acquire dedicated NOTIFY connection: %w", err)
+	}
+
+	go r.runNotifyLoop(context.Background(), sqlDB, conn)
+	return nil
+}
+
+// isConnError reports whether err indicates a broken or lost database connection.
+func isConnError(err error) bool {
+	if errors.Is(err, driver.ErrBadConn) {
+		return true
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return true
+	}
+	// lib/pq wraps connection-class errors (Class 08) as *pq.Error.
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) && pqErr.Code.Class() == "08" {
+		return true
+	}
+	return false
+}
+
+func (r *actionRepo) runNotifyLoop(ctx context.Context, sqlDB *sql.DB, conn *sql.Conn) {
+	defer func() {
+		if conn != nil {
+			conn.Close() //nolint:errcheck
+		}
+	}()
+
+	reconnect := func() {
+		if conn != nil {
+			conn.Close() //nolint:errcheck
+			conn = nil
+		}
+		if sqlDB == nil {
+			return
+		}
+		var err error
+		conn, err = sqlDB.Conn(ctx)
+		if err != nil {
+			logger.Errorf(ctx, "Failed to re-acquire NOTIFY connection: %v", err)
+			conn = nil
+		}
+	}
+
+	execNotify := func(channel, query string, args []any) bool {
+		if conn == nil {
+			reconnect()
+		}
+		if conn == nil {
+			logger.Errorf(ctx, "No NOTIFY connection available, keeping %s notifications pending", channel)
+			return false
+		}
+		if _, err := conn.ExecContext(ctx, query, args...); err != nil {
+			logger.Errorf(ctx, "Failed to NOTIFY %s notifications: %v", channel, err)
+			if isConnError(err) {
+				reconnect()
+			}
+			return false
+		}
+		return true
+	}
+
+	emit := func(channel string, bufferFrom notificationBuffer, payloads []string) []string {
+		batchSize := r.notificationConfig.batchSize
+		for start := 0; start < len(payloads); start += batchSize {
+			chunk := payloads[start:min(start+batchSize, len(payloads))]
+			var query strings.Builder
+			query.WriteString("SELECT ")
+			args := make([]any, 0, len(chunk)+1)
+			args = append(args, channel)
+			for i, payload := range chunk {
+				if i > 0 {
+					query.WriteString(", ")
+				}
+				fmt.Fprintf(&query, "pg_notify($1, $%d)", i+2)
+				args = append(args, payload)
+			}
+			if !execNotify(channel, query.String(), args) {
+				return payloads[start:]
+			}
+			r.notificationMetrics.recordSent(ctx, bufferFrom, int64(len(chunk)))
+		}
+		return nil
+	}
+
+	backoff := r.notificationConfig.retryMinBackoff
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.pendingCh:
+		}
+
+		actions, runs := r.takePendingNotifications()
+		retryActions := emit("action_updates", notificationBufferAction, actions)
+		retryRuns := emit("run_updates", notificationBufferRun, runs)
+
+		if len(retryActions) == 0 && len(retryRuns) == 0 {
+			backoff = r.notificationConfig.retryMinBackoff
+			continue
+		}
+
+		r.mergePendingActions(retryActions)
+		r.mergePendingRuns(retryRuns)
+		r.signalPending()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > r.notificationConfig.retryMaxBackoff {
+			backoff = r.notificationConfig.retryMaxBackoff
+		}
+	}
+}
+
+func (r *actionRepo) notifyActionUpdate(_ context.Context, actionID *common.ActionIdentifier) {
+	payload := fmt.Sprintf("%s/%s/%s/%s",
+		actionID.Run.Project, actionID.Run.Domain, actionID.Run.Name, actionID.Name)
+
+	r.markActionPending(payload)
+}
+
+func (r *actionRepo) markActionPending(payload string) {
+	r.notifyMu.Lock()
+	enqueuePending(
+		r.pendingActions, &r.pendingActionQueue, payload, r.notificationConfig.bufferLimit,
+		r.notificationMetrics, notificationBufferAction,
+	)
+	r.notifyMu.Unlock()
+	r.signalPending()
+}

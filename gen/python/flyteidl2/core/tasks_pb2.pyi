@@ -1,0 +1,475 @@
+from buf.validate import validate_pb2 as _validate_pb2
+from flyteidl2.common import identifier_pb2 as _identifier_pb2
+from flyteidl2.core import execution_pb2 as _execution_pb2
+from flyteidl2.core import identifier_pb2 as _identifier_pb2_1
+from flyteidl2.core import interface_pb2 as _interface_pb2
+from flyteidl2.core import literals_pb2 as _literals_pb2
+from flyteidl2.core import security_pb2 as _security_pb2
+from google.protobuf import descriptor_pb2 as _descriptor_pb2
+from google.protobuf import duration_pb2 as _duration_pb2
+from google.protobuf import struct_pb2 as _struct_pb2
+from google.protobuf import wrappers_pb2 as _wrappers_pb2
+from google.protobuf.internal import containers as _containers
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
+from google.protobuf import descriptor as _descriptor
+from google.protobuf import message as _message
+from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Mapping, Optional as _Optional, Union as _Union
+
+DESCRIPTOR: _descriptor.FileDescriptor
+
+class AcceleratorModel(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = []
+    ACCELERATOR_MODEL_UNSPECIFIED: _ClassVar[AcceleratorModel]
+    NVIDIA_K80: _ClassVar[AcceleratorModel]
+    NVIDIA_M60: _ClassVar[AcceleratorModel]
+    NVIDIA_P4: _ClassVar[AcceleratorModel]
+    NVIDIA_P100: _ClassVar[AcceleratorModel]
+    NVIDIA_V100: _ClassVar[AcceleratorModel]
+    NVIDIA_T4: _ClassVar[AcceleratorModel]
+    NVIDIA_A10: _ClassVar[AcceleratorModel]
+    NVIDIA_A10G: _ClassVar[AcceleratorModel]
+    NVIDIA_A100: _ClassVar[AcceleratorModel]
+    NVIDIA_A100_80GB: _ClassVar[AcceleratorModel]
+    NVIDIA_L4: _ClassVar[AcceleratorModel]
+    NVIDIA_L40S: _ClassVar[AcceleratorModel]
+    NVIDIA_H100: _ClassVar[AcceleratorModel]
+    NVIDIA_H100_MEGA_80GB: _ClassVar[AcceleratorModel]
+    NVIDIA_H200: _ClassVar[AcceleratorModel]
+    NVIDIA_B200: _ClassVar[AcceleratorModel]
+    NVIDIA_GB200: _ClassVar[AcceleratorModel]
+    NVIDIA_GB10: _ClassVar[AcceleratorModel]
+    NVIDIA_RTX_PRO_6000: _ClassVar[AcceleratorModel]
+    NVIDIA_RTX_PRO_4500: _ClassVar[AcceleratorModel]
+    GOOGLE_TPU_V5E: _ClassVar[AcceleratorModel]
+    GOOGLE_TPU_V5P: _ClassVar[AcceleratorModel]
+    GOOGLE_TPU_V6E: _ClassVar[AcceleratorModel]
+    AMAZON_INF1: _ClassVar[AcceleratorModel]
+    AMAZON_INF2: _ClassVar[AcceleratorModel]
+    AMAZON_TRN1: _ClassVar[AcceleratorModel]
+    AMAZON_TRN1N: _ClassVar[AcceleratorModel]
+    AMAZON_TRN2: _ClassVar[AcceleratorModel]
+    AMAZON_TRN2U: _ClassVar[AcceleratorModel]
+    AMD_MI100: _ClassVar[AcceleratorModel]
+    AMD_MI210: _ClassVar[AcceleratorModel]
+    AMD_MI250: _ClassVar[AcceleratorModel]
+    AMD_MI250X: _ClassVar[AcceleratorModel]
+    AMD_MI300A: _ClassVar[AcceleratorModel]
+    AMD_MI300X: _ClassVar[AcceleratorModel]
+    AMD_MI325X: _ClassVar[AcceleratorModel]
+    AMD_MI350X: _ClassVar[AcceleratorModel]
+    AMD_MI355X: _ClassVar[AcceleratorModel]
+    HABANA_GAUDI1: _ClassVar[AcceleratorModel]
+    APPLE_SILICON_GPU: _ClassVar[AcceleratorModel]
+
+class WorkerKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = []
+    WORKER_KIND_UNSPECIFIED: _ClassVar[WorkerKind]
+    WORKER_KIND_SANDBOX: _ClassVar[WorkerKind]
+    WORKER_KIND_MICROVM: _ClassVar[WorkerKind]
+    WORKER_KIND_REUSABLE: _ClassVar[WorkerKind]
+ACCELERATOR_MODEL_UNSPECIFIED: AcceleratorModel
+NVIDIA_K80: AcceleratorModel
+NVIDIA_M60: AcceleratorModel
+NVIDIA_P4: AcceleratorModel
+NVIDIA_P100: AcceleratorModel
+NVIDIA_V100: AcceleratorModel
+NVIDIA_T4: AcceleratorModel
+NVIDIA_A10: AcceleratorModel
+NVIDIA_A10G: AcceleratorModel
+NVIDIA_A100: AcceleratorModel
+NVIDIA_A100_80GB: AcceleratorModel
+NVIDIA_L4: AcceleratorModel
+NVIDIA_L40S: AcceleratorModel
+NVIDIA_H100: AcceleratorModel
+NVIDIA_H100_MEGA_80GB: AcceleratorModel
+NVIDIA_H200: AcceleratorModel
+NVIDIA_B200: AcceleratorModel
+NVIDIA_GB200: AcceleratorModel
+NVIDIA_GB10: AcceleratorModel
+NVIDIA_RTX_PRO_6000: AcceleratorModel
+NVIDIA_RTX_PRO_4500: AcceleratorModel
+GOOGLE_TPU_V5E: AcceleratorModel
+GOOGLE_TPU_V5P: AcceleratorModel
+GOOGLE_TPU_V6E: AcceleratorModel
+AMAZON_INF1: AcceleratorModel
+AMAZON_INF2: AcceleratorModel
+AMAZON_TRN1: AcceleratorModel
+AMAZON_TRN1N: AcceleratorModel
+AMAZON_TRN2: AcceleratorModel
+AMAZON_TRN2U: AcceleratorModel
+AMD_MI100: AcceleratorModel
+AMD_MI210: AcceleratorModel
+AMD_MI250: AcceleratorModel
+AMD_MI250X: AcceleratorModel
+AMD_MI300A: AcceleratorModel
+AMD_MI300X: AcceleratorModel
+AMD_MI325X: AcceleratorModel
+AMD_MI350X: AcceleratorModel
+AMD_MI355X: AcceleratorModel
+HABANA_GAUDI1: AcceleratorModel
+APPLE_SILICON_GPU: AcceleratorModel
+WORKER_KIND_UNSPECIFIED: WorkerKind
+WORKER_KIND_SANDBOX: WorkerKind
+WORKER_KIND_MICROVM: WorkerKind
+WORKER_KIND_REUSABLE: WorkerKind
+ACCELERATOR_NAME_FIELD_NUMBER: _ClassVar[int]
+accelerator_name: _descriptor.FieldDescriptor
+
+class Resources(_message.Message):
+    __slots__ = ["requests", "limits"]
+    class ResourceName(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = []
+        UNKNOWN: _ClassVar[Resources.ResourceName]
+        CPU: _ClassVar[Resources.ResourceName]
+        GPU: _ClassVar[Resources.ResourceName]
+        MEMORY: _ClassVar[Resources.ResourceName]
+        STORAGE: _ClassVar[Resources.ResourceName]
+        EPHEMERAL_STORAGE: _ClassVar[Resources.ResourceName]
+    UNKNOWN: Resources.ResourceName
+    CPU: Resources.ResourceName
+    GPU: Resources.ResourceName
+    MEMORY: Resources.ResourceName
+    STORAGE: Resources.ResourceName
+    EPHEMERAL_STORAGE: Resources.ResourceName
+    class ResourceEntry(_message.Message):
+        __slots__ = ["name", "value"]
+        NAME_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        name: Resources.ResourceName
+        value: str
+        def __init__(self, name: _Optional[_Union[Resources.ResourceName, str]] = ..., value: _Optional[str] = ...) -> None: ...
+    REQUESTS_FIELD_NUMBER: _ClassVar[int]
+    LIMITS_FIELD_NUMBER: _ClassVar[int]
+    requests: _containers.RepeatedCompositeFieldContainer[Resources.ResourceEntry]
+    limits: _containers.RepeatedCompositeFieldContainer[Resources.ResourceEntry]
+    def __init__(self, requests: _Optional[_Iterable[_Union[Resources.ResourceEntry, _Mapping]]] = ..., limits: _Optional[_Iterable[_Union[Resources.ResourceEntry, _Mapping]]] = ...) -> None: ...
+
+class GPUAccelerator(_message.Message):
+    __slots__ = ["device", "unpartitioned", "partition_size", "device_class", "accelerator_model"]
+    class DeviceClass(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = []
+        NVIDIA_GPU: _ClassVar[GPUAccelerator.DeviceClass]
+        GOOGLE_TPU: _ClassVar[GPUAccelerator.DeviceClass]
+        AMAZON_NEURON: _ClassVar[GPUAccelerator.DeviceClass]
+        AMD_GPU: _ClassVar[GPUAccelerator.DeviceClass]
+        HABANA_GAUDI: _ClassVar[GPUAccelerator.DeviceClass]
+        APPLE_SILICON: _ClassVar[GPUAccelerator.DeviceClass]
+    NVIDIA_GPU: GPUAccelerator.DeviceClass
+    GOOGLE_TPU: GPUAccelerator.DeviceClass
+    AMAZON_NEURON: GPUAccelerator.DeviceClass
+    AMD_GPU: GPUAccelerator.DeviceClass
+    HABANA_GAUDI: GPUAccelerator.DeviceClass
+    APPLE_SILICON: GPUAccelerator.DeviceClass
+    DEVICE_FIELD_NUMBER: _ClassVar[int]
+    UNPARTITIONED_FIELD_NUMBER: _ClassVar[int]
+    PARTITION_SIZE_FIELD_NUMBER: _ClassVar[int]
+    DEVICE_CLASS_FIELD_NUMBER: _ClassVar[int]
+    ACCELERATOR_MODEL_FIELD_NUMBER: _ClassVar[int]
+    device: str
+    unpartitioned: bool
+    partition_size: str
+    device_class: GPUAccelerator.DeviceClass
+    accelerator_model: AcceleratorModel
+    def __init__(self, device: _Optional[str] = ..., unpartitioned: bool = ..., partition_size: _Optional[str] = ..., device_class: _Optional[_Union[GPUAccelerator.DeviceClass, str]] = ..., accelerator_model: _Optional[_Union[AcceleratorModel, str]] = ...) -> None: ...
+
+class SharedMemory(_message.Message):
+    __slots__ = ["mount_path", "mount_name", "size_limit"]
+    MOUNT_PATH_FIELD_NUMBER: _ClassVar[int]
+    MOUNT_NAME_FIELD_NUMBER: _ClassVar[int]
+    SIZE_LIMIT_FIELD_NUMBER: _ClassVar[int]
+    mount_path: str
+    mount_name: str
+    size_limit: str
+    def __init__(self, mount_path: _Optional[str] = ..., mount_name: _Optional[str] = ..., size_limit: _Optional[str] = ...) -> None: ...
+
+class ExtendedResources(_message.Message):
+    __slots__ = ["gpu_accelerator", "shared_memory"]
+    GPU_ACCELERATOR_FIELD_NUMBER: _ClassVar[int]
+    SHARED_MEMORY_FIELD_NUMBER: _ClassVar[int]
+    gpu_accelerator: GPUAccelerator
+    shared_memory: SharedMemory
+    def __init__(self, gpu_accelerator: _Optional[_Union[GPUAccelerator, _Mapping]] = ..., shared_memory: _Optional[_Union[SharedMemory, _Mapping]] = ...) -> None: ...
+
+class RuntimeMetadata(_message.Message):
+    __slots__ = ["type", "version", "flavor"]
+    class RuntimeType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = []
+        OTHER: _ClassVar[RuntimeMetadata.RuntimeType]
+        FLYTE_SDK: _ClassVar[RuntimeMetadata.RuntimeType]
+    OTHER: RuntimeMetadata.RuntimeType
+    FLYTE_SDK: RuntimeMetadata.RuntimeType
+    TYPE_FIELD_NUMBER: _ClassVar[int]
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    FLAVOR_FIELD_NUMBER: _ClassVar[int]
+    type: RuntimeMetadata.RuntimeType
+    version: str
+    flavor: str
+    def __init__(self, type: _Optional[_Union[RuntimeMetadata.RuntimeType, str]] = ..., version: _Optional[str] = ..., flavor: _Optional[str] = ...) -> None: ...
+
+class TaskMetadata(_message.Message):
+    __slots__ = ["discoverable", "runtime", "timeout", "retries", "discovery_version", "deprecated_error_message", "interruptible", "cache_serializable", "tags", "pod_template_name", "cache_ignore_input_vars", "is_eager", "generates_deck", "metadata", "debuggable", "log_links", "image_build_run", "is_entrypoint", "code_bundle_uri", "timeouts", "produces_artifacts", "cache_max_age"]
+    class TagsEntry(_message.Message):
+        __slots__ = ["key", "value"]
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    DISCOVERABLE_FIELD_NUMBER: _ClassVar[int]
+    RUNTIME_FIELD_NUMBER: _ClassVar[int]
+    TIMEOUT_FIELD_NUMBER: _ClassVar[int]
+    RETRIES_FIELD_NUMBER: _ClassVar[int]
+    DISCOVERY_VERSION_FIELD_NUMBER: _ClassVar[int]
+    DEPRECATED_ERROR_MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    INTERRUPTIBLE_FIELD_NUMBER: _ClassVar[int]
+    CACHE_SERIALIZABLE_FIELD_NUMBER: _ClassVar[int]
+    TAGS_FIELD_NUMBER: _ClassVar[int]
+    POD_TEMPLATE_NAME_FIELD_NUMBER: _ClassVar[int]
+    CACHE_IGNORE_INPUT_VARS_FIELD_NUMBER: _ClassVar[int]
+    IS_EAGER_FIELD_NUMBER: _ClassVar[int]
+    GENERATES_DECK_FIELD_NUMBER: _ClassVar[int]
+    METADATA_FIELD_NUMBER: _ClassVar[int]
+    DEBUGGABLE_FIELD_NUMBER: _ClassVar[int]
+    LOG_LINKS_FIELD_NUMBER: _ClassVar[int]
+    IMAGE_BUILD_RUN_FIELD_NUMBER: _ClassVar[int]
+    IS_ENTRYPOINT_FIELD_NUMBER: _ClassVar[int]
+    CODE_BUNDLE_URI_FIELD_NUMBER: _ClassVar[int]
+    TIMEOUTS_FIELD_NUMBER: _ClassVar[int]
+    PRODUCES_ARTIFACTS_FIELD_NUMBER: _ClassVar[int]
+    CACHE_MAX_AGE_FIELD_NUMBER: _ClassVar[int]
+    discoverable: bool
+    runtime: RuntimeMetadata
+    timeout: _duration_pb2.Duration
+    retries: _literals_pb2.RetryStrategy
+    discovery_version: str
+    deprecated_error_message: str
+    interruptible: bool
+    cache_serializable: bool
+    tags: _containers.ScalarMap[str, str]
+    pod_template_name: str
+    cache_ignore_input_vars: _containers.RepeatedScalarFieldContainer[str]
+    is_eager: bool
+    generates_deck: _wrappers_pb2.BoolValue
+    metadata: K8sObjectMetadata
+    debuggable: bool
+    log_links: _containers.RepeatedCompositeFieldContainer[_execution_pb2.TaskLog]
+    image_build_run: _identifier_pb2.RunIdentifier
+    is_entrypoint: bool
+    code_bundle_uri: str
+    timeouts: _literals_pb2.TimeoutStrategy
+    produces_artifacts: bool
+    cache_max_age: _duration_pb2.Duration
+    def __init__(self, discoverable: bool = ..., runtime: _Optional[_Union[RuntimeMetadata, _Mapping]] = ..., timeout: _Optional[_Union[_duration_pb2.Duration, _Mapping]] = ..., retries: _Optional[_Union[_literals_pb2.RetryStrategy, _Mapping]] = ..., discovery_version: _Optional[str] = ..., deprecated_error_message: _Optional[str] = ..., interruptible: bool = ..., cache_serializable: bool = ..., tags: _Optional[_Mapping[str, str]] = ..., pod_template_name: _Optional[str] = ..., cache_ignore_input_vars: _Optional[_Iterable[str]] = ..., is_eager: bool = ..., generates_deck: _Optional[_Union[_wrappers_pb2.BoolValue, _Mapping]] = ..., metadata: _Optional[_Union[K8sObjectMetadata, _Mapping]] = ..., debuggable: bool = ..., log_links: _Optional[_Iterable[_Union[_execution_pb2.TaskLog, _Mapping]]] = ..., image_build_run: _Optional[_Union[_identifier_pb2.RunIdentifier, _Mapping]] = ..., is_entrypoint: bool = ..., code_bundle_uri: _Optional[str] = ..., timeouts: _Optional[_Union[_literals_pb2.TimeoutStrategy, _Mapping]] = ..., produces_artifacts: bool = ..., cache_max_age: _Optional[_Union[_duration_pb2.Duration, _Mapping]] = ...) -> None: ...
+
+class ReusePolicy(_message.Message):
+    __slots__ = ["min_replicas", "max_replicas", "concurrency", "idle_ttl", "scaledown_ttl", "scope", "name", "version"]
+    class Scope(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = []
+        GLOBAL: _ClassVar[ReusePolicy.Scope]
+        RUN: _ClassVar[ReusePolicy.Scope]
+    GLOBAL: ReusePolicy.Scope
+    RUN: ReusePolicy.Scope
+    MIN_REPLICAS_FIELD_NUMBER: _ClassVar[int]
+    MAX_REPLICAS_FIELD_NUMBER: _ClassVar[int]
+    CONCURRENCY_FIELD_NUMBER: _ClassVar[int]
+    IDLE_TTL_FIELD_NUMBER: _ClassVar[int]
+    SCALEDOWN_TTL_FIELD_NUMBER: _ClassVar[int]
+    SCOPE_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    min_replicas: int
+    max_replicas: int
+    concurrency: int
+    idle_ttl: _duration_pb2.Duration
+    scaledown_ttl: _duration_pb2.Duration
+    scope: ReusePolicy.Scope
+    name: str
+    version: str
+    def __init__(self, min_replicas: _Optional[int] = ..., max_replicas: _Optional[int] = ..., concurrency: _Optional[int] = ..., idle_ttl: _Optional[_Union[_duration_pb2.Duration, _Mapping]] = ..., scaledown_ttl: _Optional[_Union[_duration_pb2.Duration, _Mapping]] = ..., scope: _Optional[_Union[ReusePolicy.Scope, str]] = ..., name: _Optional[str] = ..., version: _Optional[str] = ...) -> None: ...
+
+class TaskTemplate(_message.Message):
+    __slots__ = ["id", "type", "metadata", "interface", "custom", "container", "k8s_pod", "sql", "task_type_version", "security_context", "extended_resources", "config", "reuse_policy", "worker_kind"]
+    class ConfigEntry(_message.Message):
+        __slots__ = ["key", "value"]
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    ID_FIELD_NUMBER: _ClassVar[int]
+    TYPE_FIELD_NUMBER: _ClassVar[int]
+    METADATA_FIELD_NUMBER: _ClassVar[int]
+    INTERFACE_FIELD_NUMBER: _ClassVar[int]
+    CUSTOM_FIELD_NUMBER: _ClassVar[int]
+    CONTAINER_FIELD_NUMBER: _ClassVar[int]
+    K8S_POD_FIELD_NUMBER: _ClassVar[int]
+    SQL_FIELD_NUMBER: _ClassVar[int]
+    TASK_TYPE_VERSION_FIELD_NUMBER: _ClassVar[int]
+    SECURITY_CONTEXT_FIELD_NUMBER: _ClassVar[int]
+    EXTENDED_RESOURCES_FIELD_NUMBER: _ClassVar[int]
+    CONFIG_FIELD_NUMBER: _ClassVar[int]
+    REUSE_POLICY_FIELD_NUMBER: _ClassVar[int]
+    WORKER_KIND_FIELD_NUMBER: _ClassVar[int]
+    id: _identifier_pb2_1.Identifier
+    type: str
+    metadata: TaskMetadata
+    interface: _interface_pb2.TypedInterface
+    custom: _struct_pb2.Struct
+    container: Container
+    k8s_pod: K8sPod
+    sql: Sql
+    task_type_version: int
+    security_context: _security_pb2.SecurityContext
+    extended_resources: ExtendedResources
+    config: _containers.ScalarMap[str, str]
+    reuse_policy: ReusePolicy
+    worker_kind: WorkerKind
+    def __init__(self, id: _Optional[_Union[_identifier_pb2_1.Identifier, _Mapping]] = ..., type: _Optional[str] = ..., metadata: _Optional[_Union[TaskMetadata, _Mapping]] = ..., interface: _Optional[_Union[_interface_pb2.TypedInterface, _Mapping]] = ..., custom: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., container: _Optional[_Union[Container, _Mapping]] = ..., k8s_pod: _Optional[_Union[K8sPod, _Mapping]] = ..., sql: _Optional[_Union[Sql, _Mapping]] = ..., task_type_version: _Optional[int] = ..., security_context: _Optional[_Union[_security_pb2.SecurityContext, _Mapping]] = ..., extended_resources: _Optional[_Union[ExtendedResources, _Mapping]] = ..., config: _Optional[_Mapping[str, str]] = ..., reuse_policy: _Optional[_Union[ReusePolicy, _Mapping]] = ..., worker_kind: _Optional[_Union[WorkerKind, str]] = ...) -> None: ...
+
+class ContainerPort(_message.Message):
+    __slots__ = ["container_port", "name"]
+    CONTAINER_PORT_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    container_port: int
+    name: str
+    def __init__(self, container_port: _Optional[int] = ..., name: _Optional[str] = ...) -> None: ...
+
+class Container(_message.Message):
+    __slots__ = ["image", "command", "args", "resources", "env", "config", "ports", "data_config", "architecture"]
+    class Architecture(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = []
+        UNKNOWN: _ClassVar[Container.Architecture]
+        AMD64: _ClassVar[Container.Architecture]
+        ARM64: _ClassVar[Container.Architecture]
+        ARM_V6: _ClassVar[Container.Architecture]
+        ARM_V7: _ClassVar[Container.Architecture]
+    UNKNOWN: Container.Architecture
+    AMD64: Container.Architecture
+    ARM64: Container.Architecture
+    ARM_V6: Container.Architecture
+    ARM_V7: Container.Architecture
+    IMAGE_FIELD_NUMBER: _ClassVar[int]
+    COMMAND_FIELD_NUMBER: _ClassVar[int]
+    ARGS_FIELD_NUMBER: _ClassVar[int]
+    RESOURCES_FIELD_NUMBER: _ClassVar[int]
+    ENV_FIELD_NUMBER: _ClassVar[int]
+    CONFIG_FIELD_NUMBER: _ClassVar[int]
+    PORTS_FIELD_NUMBER: _ClassVar[int]
+    DATA_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    ARCHITECTURE_FIELD_NUMBER: _ClassVar[int]
+    image: str
+    command: _containers.RepeatedScalarFieldContainer[str]
+    args: _containers.RepeatedScalarFieldContainer[str]
+    resources: Resources
+    env: _containers.RepeatedCompositeFieldContainer[_literals_pb2.KeyValuePair]
+    config: _containers.RepeatedCompositeFieldContainer[_literals_pb2.KeyValuePair]
+    ports: _containers.RepeatedCompositeFieldContainer[ContainerPort]
+    data_config: DataLoadingConfig
+    architecture: Container.Architecture
+    def __init__(self, image: _Optional[str] = ..., command: _Optional[_Iterable[str]] = ..., args: _Optional[_Iterable[str]] = ..., resources: _Optional[_Union[Resources, _Mapping]] = ..., env: _Optional[_Iterable[_Union[_literals_pb2.KeyValuePair, _Mapping]]] = ..., config: _Optional[_Iterable[_Union[_literals_pb2.KeyValuePair, _Mapping]]] = ..., ports: _Optional[_Iterable[_Union[ContainerPort, _Mapping]]] = ..., data_config: _Optional[_Union[DataLoadingConfig, _Mapping]] = ..., architecture: _Optional[_Union[Container.Architecture, str]] = ...) -> None: ...
+
+class IOStrategy(_message.Message):
+    __slots__ = ["download_mode", "upload_mode"]
+    class DownloadMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = []
+        DOWNLOAD_EAGER: _ClassVar[IOStrategy.DownloadMode]
+        DOWNLOAD_STREAM: _ClassVar[IOStrategy.DownloadMode]
+        DO_NOT_DOWNLOAD: _ClassVar[IOStrategy.DownloadMode]
+    DOWNLOAD_EAGER: IOStrategy.DownloadMode
+    DOWNLOAD_STREAM: IOStrategy.DownloadMode
+    DO_NOT_DOWNLOAD: IOStrategy.DownloadMode
+    class UploadMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = []
+        UPLOAD_ON_EXIT: _ClassVar[IOStrategy.UploadMode]
+        UPLOAD_EAGER: _ClassVar[IOStrategy.UploadMode]
+        DO_NOT_UPLOAD: _ClassVar[IOStrategy.UploadMode]
+    UPLOAD_ON_EXIT: IOStrategy.UploadMode
+    UPLOAD_EAGER: IOStrategy.UploadMode
+    DO_NOT_UPLOAD: IOStrategy.UploadMode
+    DOWNLOAD_MODE_FIELD_NUMBER: _ClassVar[int]
+    UPLOAD_MODE_FIELD_NUMBER: _ClassVar[int]
+    download_mode: IOStrategy.DownloadMode
+    upload_mode: IOStrategy.UploadMode
+    def __init__(self, download_mode: _Optional[_Union[IOStrategy.DownloadMode, str]] = ..., upload_mode: _Optional[_Union[IOStrategy.UploadMode, str]] = ...) -> None: ...
+
+class DataLoadingConfig(_message.Message):
+    __slots__ = ["enabled", "input_path", "output_path", "format", "io_strategy", "file_input_layout"]
+    class LiteralMapFormat(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = []
+        JSON: _ClassVar[DataLoadingConfig.LiteralMapFormat]
+        YAML: _ClassVar[DataLoadingConfig.LiteralMapFormat]
+        PROTO: _ClassVar[DataLoadingConfig.LiteralMapFormat]
+    JSON: DataLoadingConfig.LiteralMapFormat
+    YAML: DataLoadingConfig.LiteralMapFormat
+    PROTO: DataLoadingConfig.LiteralMapFormat
+    class FileInputLayout(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = []
+        DIRECT: _ClassVar[DataLoadingConfig.FileInputLayout]
+        NAMED_DIR: _ClassVar[DataLoadingConfig.FileInputLayout]
+    DIRECT: DataLoadingConfig.FileInputLayout
+    NAMED_DIR: DataLoadingConfig.FileInputLayout
+    ENABLED_FIELD_NUMBER: _ClassVar[int]
+    INPUT_PATH_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_PATH_FIELD_NUMBER: _ClassVar[int]
+    FORMAT_FIELD_NUMBER: _ClassVar[int]
+    IO_STRATEGY_FIELD_NUMBER: _ClassVar[int]
+    FILE_INPUT_LAYOUT_FIELD_NUMBER: _ClassVar[int]
+    enabled: bool
+    input_path: str
+    output_path: str
+    format: DataLoadingConfig.LiteralMapFormat
+    io_strategy: IOStrategy
+    file_input_layout: DataLoadingConfig.FileInputLayout
+    def __init__(self, enabled: bool = ..., input_path: _Optional[str] = ..., output_path: _Optional[str] = ..., format: _Optional[_Union[DataLoadingConfig.LiteralMapFormat, str]] = ..., io_strategy: _Optional[_Union[IOStrategy, _Mapping]] = ..., file_input_layout: _Optional[_Union[DataLoadingConfig.FileInputLayout, str]] = ...) -> None: ...
+
+class K8sPod(_message.Message):
+    __slots__ = ["metadata", "pod_spec", "data_config", "primary_container_name"]
+    METADATA_FIELD_NUMBER: _ClassVar[int]
+    POD_SPEC_FIELD_NUMBER: _ClassVar[int]
+    DATA_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    PRIMARY_CONTAINER_NAME_FIELD_NUMBER: _ClassVar[int]
+    metadata: K8sObjectMetadata
+    pod_spec: _struct_pb2.Struct
+    data_config: DataLoadingConfig
+    primary_container_name: str
+    def __init__(self, metadata: _Optional[_Union[K8sObjectMetadata, _Mapping]] = ..., pod_spec: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., data_config: _Optional[_Union[DataLoadingConfig, _Mapping]] = ..., primary_container_name: _Optional[str] = ...) -> None: ...
+
+class K8sObjectMetadata(_message.Message):
+    __slots__ = ["labels", "annotations"]
+    class LabelsEntry(_message.Message):
+        __slots__ = ["key", "value"]
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    class AnnotationsEntry(_message.Message):
+        __slots__ = ["key", "value"]
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    LABELS_FIELD_NUMBER: _ClassVar[int]
+    ANNOTATIONS_FIELD_NUMBER: _ClassVar[int]
+    labels: _containers.ScalarMap[str, str]
+    annotations: _containers.ScalarMap[str, str]
+    def __init__(self, labels: _Optional[_Mapping[str, str]] = ..., annotations: _Optional[_Mapping[str, str]] = ...) -> None: ...
+
+class Sql(_message.Message):
+    __slots__ = ["statement", "dialect"]
+    class Dialect(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = []
+        UNDEFINED: _ClassVar[Sql.Dialect]
+        ANSI: _ClassVar[Sql.Dialect]
+        HIVE: _ClassVar[Sql.Dialect]
+        OTHER: _ClassVar[Sql.Dialect]
+    UNDEFINED: Sql.Dialect
+    ANSI: Sql.Dialect
+    HIVE: Sql.Dialect
+    OTHER: Sql.Dialect
+    STATEMENT_FIELD_NUMBER: _ClassVar[int]
+    DIALECT_FIELD_NUMBER: _ClassVar[int]
+    statement: str
+    dialect: Sql.Dialect
+    def __init__(self, statement: _Optional[str] = ..., dialect: _Optional[_Union[Sql.Dialect, str]] = ...) -> None: ...

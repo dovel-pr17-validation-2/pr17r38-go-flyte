@@ -1,0 +1,112 @@
+package config
+
+import (
+	"time"
+
+	"github.com/flyteorg/flyte/v2/flytestdlib/config"
+	"github.com/flyteorg/flyte/v2/flytestdlib/serviceclient"
+)
+
+// AppConfig holds configuration for the control plane AppService.
+type AppConfig struct {
+	// Server configures the standalone App service HTTP listener.
+	Server ServerConfig `json:"server"`
+
+	// PprofPort is the port the pprof endpoint binds to. 0 disables profiling.
+	PprofPort int `json:"pprofPort" pflag:",Port the pprof endpoint binds to; 0 disables profiling"`
+
+	// InternalAppService configures the InternalAppService client (data plane).
+	// In unified mode this is overridden by the shared mux BaseURL.
+	InternalAppService serviceclient.ServiceConfig `json:"internalAppService" pflag:",Internal app service client configuration"`
+
+	// CacheTTL is the TTL for the in-memory app status cache.
+	// Defaults to 30s. Set to 0 to disable caching.
+	CacheTTL time.Duration `json:"cacheTtl" pflag:",TTL for app status cache"`
+}
+
+// ServerConfig holds HTTP server configuration.
+type ServerConfig struct {
+	Port int    `json:"port" pflag:",Port to bind the HTTP server"`
+	Host string `json:"host" pflag:",Host to bind the HTTP server"`
+}
+
+const appConfigSectionKey = "apps"
+
+var defaultAppConfig = &AppConfig{
+	Server: ServerConfig{
+		Host: "0.0.0.0",
+		Port: 8095,
+	},
+	InternalAppService: serviceclient.ServiceConfig{URL: "http://localhost:8091"},
+	CacheTTL:           30 * time.Second,
+}
+
+var appConfigSection = config.MustRegisterSection(appConfigSectionKey, defaultAppConfig)
+
+// GetAppConfig returns the current AppConfig.
+func GetAppConfig() *AppConfig {
+	return appConfigSection.GetConfig().(*AppConfig)
+}
+
+const internalAppConfigSectionKey = "internalApps"
+
+//go:generate pflags InternalAppConfig --default-var=defaultInternalAppConfig
+
+// InternalAppConfig holds configuration for the data plane InternalAppService.
+type InternalAppConfig struct {
+	// Enabled controls whether the InternalAppService is started.
+	Enabled bool `json:"enabled" pflag:",Enable app deployment controller"`
+
+	// BaseDomain is the base domain used to generate public URLs for apps.
+	// Apps are exposed at "{name}-{project}-{domain}.{base_domain}".
+	BaseDomain string `json:"baseDomain" pflag:",Base domain for app public URLs"`
+
+	// Scheme is the URL scheme used for public app URLs ("http" or "https").
+	// Defaults to "https" if unset.
+	Scheme string `json:"scheme" pflag:",URL scheme for app public URLs (http or https)"`
+
+	// DefaultRequestTimeout is the request timeout applied to apps that don't specify one.
+	DefaultRequestTimeout time.Duration `json:"defaultRequestTimeout" pflag:",Default request timeout for apps"`
+
+	// MaxRequestTimeout is the hard cap on request timeout (Knative max is 3600s).
+	MaxRequestTimeout time.Duration `json:"maxRequestTimeout" pflag:",Maximum allowed request timeout for apps"`
+
+	// IngressAppsPort is the port appended to the public app URL (e.g. 30081).
+	// Set to 0 to omit the port when behind a standard 80/443 proxy.
+	IngressAppsPort int `json:"ingressAppsPort" pflag:",Port for app subdomain URLs (0 = omit)"`
+
+	// DefaultEnvVars is a map of environment variables injected into every KService
+	// pod at deploy time, in addition to any env vars specified in the app spec.
+	// Use this to inject cluster-internal endpoints (e.g. _U_EP_OVERRIDE) that app
+	// processes need to connect back to the Flyte manager.
+	DefaultEnvVars map[string]string `json:"defaultEnvVars" pflag:"-,Default env vars injected into every app pod"`
+
+	// NamespacedNameSuffixTemplate is the template for generating the INTERNAL_APP_ENDPOINT_PATTERN env var.
+	// Supported variables: {{ project }}, {{ domain }}.
+	// Example: "{{ project }}-{{ domain }}"
+	NamespacedNameSuffixTemplate string `json:"namespacedNameSuffixTemplate" pflag:",Template for internal app endpoint pattern (e.g., {{ project }}-{{ domain }})"`
+
+	// WatchBufferSize is the buffer size for each subscriber's event channel.
+	// A larger value reduces the chance of dropped events under burst load.
+	WatchBufferSize int `json:"watchBufferSize" pflag:",Buffer size for watch subscriber channels"`
+
+	// DefaultServiceAccount is assigned to app pods that don't request one via their
+	// security context. Empty means the namespace's `default` ServiceAccount is used.
+	// Set this to the flyte service account (which carries the IRSA role) so app pods
+	// get cloud credentials/region for object storage.
+	DefaultServiceAccount string `json:"defaultServiceAccount" pflag:",Default k8s service account for app pods when the app does not set one"`
+}
+
+var defaultInternalAppConfig = &InternalAppConfig{
+	DefaultRequestTimeout:        300 * time.Second,
+	MaxRequestTimeout:            3600 * time.Second,
+	WatchBufferSize:              100,
+	NamespacedNameSuffixTemplate: "{{ project }}-{{ domain }}",
+}
+
+var internalAppConfigSection = config.MustRegisterSection(internalAppConfigSectionKey, defaultInternalAppConfig)
+
+// GetInternalAppConfig returns the current InternalAppConfig.
+func GetInternalAppConfig() *InternalAppConfig {
+	return internalAppConfigSection.GetConfig().(*InternalAppConfig)
+}

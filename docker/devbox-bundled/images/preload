@@ -1,0 +1,18 @@
+#!/bin/sh
+
+set -ex
+
+__save_image() {
+  local dest="$1"
+  local tar="$(echo ${dest} | cut -d: -f1 | tr / -).tar"
+  local src="$( [ -n "$2" ] && echo "$2" || echo ${dest} )"
+  skopeo copy --override-arch "${TARGETARCH}" --override-os linux \
+    "docker://${src}" "docker-archive:${tar}:${dest}"
+}
+
+MANIFEST="$(realpath "$1")"
+mkdir -p images
+cd images
+while read line; do
+  __save_image $(echo ${line} | tr = ' ')
+done < ${MANIFEST}

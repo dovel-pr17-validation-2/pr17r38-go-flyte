@@ -1,0 +1,131 @@
+package config
+
+import (
+	"time"
+
+	stdconfig "github.com/flyteorg/flyte/v2/flytestdlib/config"
+	"github.com/flyteorg/flyte/v2/flytestdlib/serviceclient"
+)
+
+const configSectionKey = "executor"
+
+//go:generate pflags Config --default-var=defaultConfig
+
+var (
+	defaultConfig = &Config{
+		MetricsBindAddress:     ":10254",
+		HealthProbeBindAddress: ":8081",
+		LeaderElect:            false,
+		MetricsSecure:          true,
+		WebhookCertName:        "tls.crt",
+		WebhookCertKey:         "tls.key",
+		MetricsCertName:        "tls.crt",
+		MetricsCertKey:         "tls.key",
+		EnableHTTP2:            false,
+		// An idle connection per concurrent reconcile (MaxConcurrentReconciles).
+		EventsService: serviceclient.ServiceConfig{
+			URL:  "http://localhost:8090",
+			HTTP: serviceclient.HTTPConfig{MaxIdleConnsPerHost: 512},
+		},
+		CacheService: serviceclient.ServiceConfig{
+			URL:  "http://localhost:8094",
+			HTTP: serviceclient.HTTPConfig{MaxIdleConnsPerHost: 512},
+		},
+		Cluster:                 "",
+		MaxSystemFailures:       3,
+		MaxConcurrentReconciles: 512,
+		RequeueDuration:         stdconfig.Duration{Duration: 10 * time.Second},
+		GC: GCConfig{
+			Interval: stdconfig.Duration{Duration: 30 * time.Minute},
+			MaxTTL:   stdconfig.Duration{Duration: 1 * time.Hour},
+		},
+	}
+
+	configSection = stdconfig.MustRegisterSection(configSectionKey, defaultConfig)
+)
+
+// Config holds the configuration for the executor controller manager
+type Config struct {
+	// MetricsBindAddress is the address the metrics endpoint binds to.
+	// Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable.
+	MetricsBindAddress string `json:"metricsBindAddress" pflag:",Address the metrics endpoint binds to"`
+
+	// PprofBindAddress is the address the pprof endpoint binds to. Empty or "0" disables profiling.
+	PprofBindAddress string `json:"pprofBindAddress" pflag:",Address the pprof endpoint binds to; empty or 0 disables profiling"`
+
+	// HealthProbeBindAddress is the address the probe endpoint binds to.
+	HealthProbeBindAddress string `json:"healthProbeBindAddress" pflag:",Address the probe endpoint binds to"`
+
+	// LeaderElect enables leader election for controller manager.
+	LeaderElect bool `json:"leaderElect" pflag:",Enable leader election for controller manager"`
+
+	// MetricsSecure controls whether the metrics endpoint is served via HTTPS.
+	MetricsSecure bool `json:"metricsSecure" pflag:",Serve metrics endpoint via HTTPS"`
+
+	// WebhookCertPath is the directory containing the webhook certificate.
+	WebhookCertPath string `json:"webhookCertPath" pflag:",Directory containing the webhook certificate"`
+
+	// WebhookCertName is the name of the webhook certificate file.
+	WebhookCertName string `json:"webhookCertName" pflag:",Name of the webhook certificate file"`
+
+	// WebhookCertKey is the name of the webhook key file.
+	WebhookCertKey string `json:"webhookCertKey" pflag:",Name of the webhook key file"`
+
+	// MetricsCertPath is the directory containing the metrics server certificate.
+	MetricsCertPath string `json:"metricsCertPath" pflag:",Directory containing the metrics server certificate"`
+
+	// MetricsCertName is the name of the metrics server certificate file.
+	MetricsCertName string `json:"metricsCertName" pflag:",Name of the metrics server certificate file"`
+
+	// MetricsCertKey is the name of the metrics server key file.
+	MetricsCertKey string `json:"metricsCertKey" pflag:",Name of the metrics server key file"`
+
+	// EnableHTTP2 enables HTTP/2 for the metrics and webhook servers.
+	EnableHTTP2 bool `json:"enableHTTP2" pflag:",Enable HTTP/2 for metrics and webhook servers"`
+
+	// EventsService configures the event service used for action state updates.
+	EventsService serviceclient.ServiceConfig `json:"eventsService" pflag:",Event service client configuration"`
+
+	// CacheService configures the cache service used for catalog operations.
+	CacheService serviceclient.ServiceConfig `json:"cacheService" pflag:",Cache service client configuration"`
+
+	// Cluster is the cluster identifier attached to action events.
+	Cluster string `json:"cluster" pflag:",Cluster identifier for action events"`
+
+	// DefaultK8sServiceAccount is assigned to task pods when the task's security
+	// context does not specify one. Empty means no account is set, so Kubernetes
+	// assigns the `default` ServiceAccount of the pod's own namespace.
+	DefaultK8sServiceAccount string `json:"defaultK8sServiceAccount" pflag:",Default Kubernetes service account for task pods when the task does not set one"`
+
+	// MaxSystemFailures bounds the system-level failures (Plugin.Handle Go errors and
+	// plugin-reported system-retryable failures) one attempt may take before the
+	// TaskAction is converted to a permanent failure.
+	MaxSystemFailures int32 `json:"maxSystemFailures" pflag:",Max system-level failures per attempt before forcing permanent failure"`
+
+	// MaxConcurrentReconciles is the maximum number of concurrent reconcile loops for TaskActions.
+	MaxConcurrentReconciles int `json:"maxConcurrentReconciles" pflag:",Max concurrent reconcile loops for TaskActions"`
+
+	// RequeueDuration is how long the controller waits before reconciling a running
+	// TaskAction again. Lowering it makes task actions more responsive at the cost of
+	// more reconciles and more load on the plugin backends. 0 or unset means the
+	// built-in default of 10s.
+	RequeueDuration stdconfig.Duration `json:"requeueDuration" pflag:",How long to wait before reconciling a running TaskAction again. 0 means the default of 10s"`
+
+	// GC configures the garbage collector for terminal TaskActions.
+	GC GCConfig `json:"gc" pflag:",Garbage collector configuration for terminal TaskActions"`
+}
+
+// GCConfig holds the configuration for the TaskAction garbage collector.
+type GCConfig struct {
+	// Interval is how often the garbage collector runs. 0 disables GC.
+	Interval stdconfig.Duration `json:"interval" pflag:",How often the garbage collector runs. 0 disables GC."`
+
+	// MaxTTL is the time-to-live for terminal TaskActions before deletion.
+	// A value <= 0 deletes terminal TaskActions on the next GC cycle.
+	MaxTTL stdconfig.Duration `json:"maxTTL" pflag:",Time-to-live for terminal TaskActions before deletion. <= 0 deletes terminal TaskActions immediately."`
+}
+
+// GetConfig returns the parsed executor configuration
+func GetConfig() *Config {
+	return configSection.GetConfig().(*Config)
+}

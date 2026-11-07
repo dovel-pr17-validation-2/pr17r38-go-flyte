@@ -1,0 +1,73 @@
+package config
+
+import (
+	"github.com/flyteorg/flyte/v2/flytestdlib/app"
+	"github.com/flyteorg/flyte/v2/flytestdlib/config"
+	"github.com/flyteorg/flyte/v2/flytestdlib/serviceclient"
+)
+
+const configSectionKey = "actions"
+
+//go:generate pflags Config --default-var=defaultConfig
+
+var defaultConfig = &Config{
+	Server: ServerConfig{
+		Port: 8091,
+		Host: "0.0.0.0",
+	},
+	Kubernetes: app.K8sConfig{
+		Namespace: "flyte",
+		QPS:       1000,
+		Burst:     2000,
+		Timeout:   "30s",
+	},
+	// NOTE: total buffering is WatchWorkers * WatchBufferSize watch.Event entries.
+	// Each entry includes a DeepCopy() of the TaskAction; tune carefully to avoid large memory spikes under backlog.
+	WatchBufferSize: 1000,
+	WatchWorkers:    100,
+	RunService: serviceclient.ServiceConfig{
+		URL:  "http://localhost:8090",
+		HTTP: serviceclient.HTTPConfig{MaxIdleConnsPerHost: 512},
+	},
+	// 8M slots × 8 bytes/pointer = 64 MB; can track ~8M unique actions.
+	RecordFilterSize: 1 << 23,
+}
+
+var configSection = config.MustRegisterSection(configSectionKey, defaultConfig)
+
+// Config holds the configuration for the Actions service
+type Config struct {
+	// HTTP server configuration
+	Server ServerConfig `json:"server"`
+
+	// PprofPort is the port the pprof endpoint binds to. 0 disables profiling.
+	PprofPort int `json:"pprofPort" pflag:",Port the pprof endpoint binds to; 0 disables profiling"`
+
+	// Kubernetes configuration (namespace where TaskAction CRs live; the unified
+	// binary shares the manager's client, this is read by the standalone cmd).
+	Kubernetes app.K8sConfig `json:"kubernetes"`
+
+	// WatchBufferSize is the buffer size for each worker's event channel.
+	WatchBufferSize int `json:"watchBufferSize" pflag:",Buffer size for watch channels"`
+
+	// WatchWorkers is the number of parallel event-processing goroutines.
+	// Events for the same TaskAction are always routed to the same worker to preserve ordering.
+	WatchWorkers int `json:"watchWorkers" pflag:",Number of parallel worker goroutines for processing watch events"`
+
+	// RunService configures the internal run service client.
+	RunService serviceclient.ServiceConfig `json:"runService" pflag:",Internal run service client configuration"`
+
+	// RecordFilterSize is the size of the bloom filter used to deduplicate RecordAction calls.
+	RecordFilterSize int `json:"recordFilterSize" pflag:",Size of the oppo bloom filter for deduplicating RecordAction calls"`
+}
+
+// ServerConfig holds HTTP server configuration
+type ServerConfig struct {
+	Port int    `json:"port" pflag:",Port to bind the HTTP server"`
+	Host string `json:"host" pflag:",Host to bind the HTTP server"`
+}
+
+// GetConfig returns the parsed actions configuration
+func GetConfig() *Config {
+	return configSection.GetConfig().(*Config)
+}

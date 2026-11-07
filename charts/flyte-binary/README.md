@@ -1,0 +1,189 @@
+# flyte-binary
+
+![Version: v0.2.0](https://img.shields.io/badge/Version-v0.2.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)
+
+Chart for basic single Flyte executable deployment
+
+## Requirements
+
+| Repository | Name | Version |
+|------------|------|---------|
+| file://../flyteconnector | flyteconnector | v2.0.0 |
+
+## Values
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| commonAnnotations | object | `{}` |  |
+| commonLabels | object | `{}` |  |
+| configuration.annotations | object | `{}` |  |
+| configuration.co-pilot.image.repository | string | `"cr.flyte.org/flyteorg/flyte-binary-v2"` |  |
+| configuration.co-pilot.image.tag | string | `"latest"` |  |
+| configuration.co-pilot.storageSecretRef | string | `""` |  |
+| configuration.connectorService.defaultConnector.defaultTimeout | string | `"10s"` |  |
+| configuration.connectorService.defaultConnector.endpoint | string | `"k8s://flyteconnector.flyte:8000"` |  |
+| configuration.connectorService.defaultConnector.insecure | bool | `true` |  |
+| configuration.connectorService.defaultConnector.timeouts.GetTask | string | `"10s"` |  |
+| configuration.connectorService.defaultConnector.timeouts.ListAgents | string | `"3s"` |  |
+| configuration.database.connMaxLifeTime | string | `"1h"` |  |
+| configuration.database.maxIdleConnections | int | `10` |  |
+| configuration.database.maxOpenConnections | int | `100` |  |
+| configuration.database.postgres.dbname | string | `"flyte"` |  |
+| configuration.database.postgres.debug | bool | `false` |  |
+| configuration.database.postgres.host | string | `"127.0.0.1"` |  |
+| configuration.database.postgres.options | string | `"sslmode=disable"` |  |
+| configuration.database.postgres.password | string | `""` |  |
+| configuration.database.postgres.passwordPath | string | `""` |  |
+| configuration.database.postgres.port | int | `5432` |  |
+| configuration.database.postgres.username | string | `"postgres"` |  |
+| configuration.externalConfigMap | string | `""` |  |
+| configuration.externalSecretRef | string | `""` |  |
+| configuration.extraInlineConfigMapRefs | list | `[]` |  |
+| configuration.extraInlineSecretRefs | list | `[]` |  |
+| configuration.inline | object | `{}` |  |
+| configuration.inlineConfigMap | string | `""` |  |
+| configuration.inlineSecretRef | string | `""` |  |
+| configuration.labels | object | `{}` |  |
+| configuration.logging.level | int | `1` |  |
+| configuration.logging.plugins.cloudwatch.enabled | bool | `false` |  |
+| configuration.logging.plugins.cloudwatch.templateUri | string | `""` |  |
+| configuration.logging.plugins.custom | list | `[]` |  |
+| configuration.logging.plugins.kubernetes.enabled | bool | `false` |  |
+| configuration.logging.plugins.kubernetes.templateUri | string | `""` |  |
+| configuration.logging.plugins.stackdriver.enabled | bool | `false` |  |
+| configuration.logging.plugins.stackdriver.templateUri | string | `""` |  |
+| configuration.storage.metadataContainer | string | `"my-organization-flyte-container"` |  |
+| configuration.storage.provider | string | `"s3"` |  |
+| configuration.storage.providerConfig.azure.account | string | `"storage-account-name"` |  |
+| configuration.storage.providerConfig.azure.configDomainSuffix | string | `""` |  |
+| configuration.storage.providerConfig.azure.configUploadConcurrency | int | `4` |  |
+| configuration.storage.providerConfig.azure.key | string | `""` |  |
+| configuration.storage.providerConfig.gcs.project | string | `"my-organization-gcp-project"` |  |
+| configuration.storage.providerConfig.s3.accessKey | string | `""` |  |
+| configuration.storage.providerConfig.s3.authType | string | `"iam"` |  |
+| configuration.storage.providerConfig.s3.disableSSL | bool | `false` |  |
+| configuration.storage.providerConfig.s3.endpoint | string | `""` |  |
+| configuration.storage.providerConfig.s3.region | string | `"us-east-1"` |  |
+| configuration.storage.providerConfig.s3.secretKey | string | `""` |  |
+| configuration.storage.providerConfig.s3.secretKeyPath | string | `""` |  |
+| configuration.storage.providerConfig.s3.v2Signing | bool | `false` |  |
+| console.affinity | object | `{}` |  |
+| console.basePath | string | `"/v2"` |  |
+| console.containerPort | int | `8080` |  |
+| console.env | list | `[]` |  |
+| console.image.pullPolicy | string | `"IfNotPresent"` |  |
+| console.image.repository | string | `"ghcr.io/unionai-oss/flyteconsole-v2"` |  |
+| console.image.tag | string | `"latest"` |  |
+| console.imagePullSecrets | list | `[]` |  |
+| console.nodeSelector | object | `{}` |  |
+| console.podAnnotations | object | `{}` |  |
+| console.podLabels | object | `{}` |  |
+| console.replicaCount | int | `1` |  |
+| console.resources | object | `{}` |  |
+| console.securityContext | object | `{}` |  |
+| console.service.nodePort | string | `""` |  |
+| console.service.port | int | `80` |  |
+| console.service.type | string | `"ClusterIP"` |  |
+| console.tolerations | list | `[]` |  |
+| deployment.annotations | object | `{}` |  |
+| deployment.args | list | `[]` |  |
+| deployment.command | list | `[]` |  |
+| deployment.extraEnvVars | list | `[]` |  |
+| deployment.extraEnvVarsConfigMap | string | `""` |  |
+| deployment.extraEnvVarsSecret | string | `""` |  |
+| deployment.extraPodSpec | object | `{}` |  |
+| deployment.extraVolumeMounts | list | `[]` |  |
+| deployment.extraVolumes | list | `[]` |  |
+| deployment.genAdminAuthSecret.args | list | `[]` |  |
+| deployment.genAdminAuthSecret.command | list | `[]` |  |
+| deployment.genAdminAuthSecret.securityContext | object | `{}` |  |
+| deployment.image.pullPolicy | string | `"IfNotPresent"` |  |
+| deployment.image.repository | string | `"cr.flyte.org/flyteorg/flyte-binary-v2"` |  |
+| deployment.image.tag | string | `"latest"` |  |
+| deployment.initContainers | list | `[]` |  |
+| deployment.labels | object | `{}` |  |
+| deployment.lifecycleHooks | object | `{}` |  |
+| deployment.livenessProbe | object | `{}` |  |
+| deployment.podAnnotations | object | `{}` |  |
+| deployment.podLabels | object | `{}` |  |
+| deployment.podSecurityContext.enabled | bool | `false` |  |
+| deployment.podSecurityContext.fsGroup | int | `65534` |  |
+| deployment.podSecurityContext.runAsGroup | int | `65534` |  |
+| deployment.podSecurityContext.runAsUser | int | `65534` |  |
+| deployment.preInitContainers | list | `[]` |  |
+| deployment.readinessProbe | object | `{}` |  |
+| deployment.securityContext | object | `{}` |  |
+| deployment.sidecars | list | `[]` |  |
+| deployment.startupProbe | object | `{}` |  |
+| deployment.waitForDB.args | list | `[]` |  |
+| deployment.waitForDB.command | list | `[]` |  |
+| deployment.waitForDB.image.pullPolicy | string | `"IfNotPresent"` |  |
+| deployment.waitForDB.image.repository | string | `"postgres"` |  |
+| deployment.waitForDB.image.tag | string | `"15-alpine"` |  |
+| deployment.waitForDB.securityContext | object | `{}` |  |
+| enabled_plugins.tasks | object | `{"task-plugins":{"default-for-task-types":{"container":"container","container_array":"k8s-array","sidecar":"sidecar"}}}` | Tasks specific configuration [structure](https://pkg.go.dev/github.com/flyteorg/flytepropeller/pkg/controller/nodes/task/config#GetConfig) |
+| enabled_plugins.tasks.task-plugins | object | `{"default-for-task-types":{"container":"container","container_array":"k8s-array","sidecar":"sidecar"}}` | Plugins configuration, [structure](https://pkg.go.dev/github.com/flyteorg/flytepropeller/pkg/controller/nodes/task/config#TaskPluginConfig) |
+| flyte-core-components.actions.kubernetes.kubeconfig | string | `""` |  |
+| flyte-core-components.actions.kubernetes.namespace | string | `"flyte"` |  |
+| flyte-core-components.actions.watchBufferSize | int | `100` |  |
+| flyte-core-components.dataproxy.download.maxExpiresIn | string | `"1h"` |  |
+| flyte-core-components.dataproxy.upload.defaultFileNameLength | int | `20` |  |
+| flyte-core-components.dataproxy.upload.maxExpiresIn | string | `"1h"` |  |
+| flyte-core-components.dataproxy.upload.maxSize | string | `"100Mi"` |  |
+| flyte-core-components.dataproxy.upload.storagePrefix | string | `"uploads"` |  |
+| flyte-core-components.runs.server.host | string | `"0.0.0.0"` |  |
+| flyte-core-components.runs.server.port | int | `8090` |  |
+| flyte-core-components.runs.storagePrefix | string | `"s3://flyte-data"` |  |
+| flyte-core-components.runs.watchBufferSize | int | `100` |  |
+| flyte-core-components.secret.kubernetes.burst | int | `200` |  |
+| flyte-core-components.secret.kubernetes.clusterName | string | `"flyte-devbox"` |  |
+| flyte-core-components.secret.kubernetes.kubeconfig | string | `""` |  |
+| flyte-core-components.secret.kubernetes.namespace | string | `"{{ .Release.Namespace }}"` |  |
+| flyte-core-components.secret.kubernetes.qps | int | `100` |  |
+| flyte-core-components.secret.kubernetes.timeout | string | `"30s"` |  |
+| flyte-core-components.secret.webhook.url | string | `"http://{{ include \"flyte-binary.webhook.headlessServiceName\" . }}.{{ .Release.Namespace }}.svc:9444"` |  |
+| fullnameOverride | string | `""` |  |
+| ingress.apiJwtIngress.annotations | object | `{}` |  |
+| ingress.apiJwtIngress.enabled | bool | `false` |  |
+| ingress.apiJwtIngress.host | string | `""` |  |
+| ingress.apiJwtIngress.ingressClassName | string | `""` |  |
+| ingress.apiJwtIngress.tls | list | `[]` |  |
+| ingress.commonAnnotations | object | `{}` |  |
+| ingress.create | bool | `false` |  |
+| ingress.host | string | `""` |  |
+| ingress.httpAnnotations | object | `{}` |  |
+| ingress.httpExtraPaths.append | list | `[]` |  |
+| ingress.httpExtraPaths.prepend | list | `[]` |  |
+| ingress.httpIngressClassName | string | `""` |  |
+| ingress.httpTls | list | `[]` |  |
+| ingress.ingressClassName | string | `""` |  |
+| ingress.labels | object | `{}` |  |
+| ingress.tls | list | `[]` |  |
+| ingress.wellknownIngress.annotations | object | `{}` |  |
+| ingress.wellknownIngress.enabled | bool | `false` |  |
+| ingress.wellknownIngress.host | string | `""` |  |
+| ingress.wellknownIngress.ingressClassName | string | `""` |  |
+| ingress.wellknownIngress.tls | list | `[]` |  |
+| nameOverride | string | `""` |  |
+| rbac.annotations | object | `{}` |  |
+| rbac.create | bool | `true` |  |
+| rbac.extraRules | list | `[]` |  |
+| rbac.labels | object | `{}` |  |
+| service.clusterIP | string | `""` |  |
+| service.commonAnnotations | object | `{}` |  |
+| service.externalTrafficPolicy | string | `"Cluster"` |  |
+| service.extraPorts | list | `[]` |  |
+| service.httpAnnotations | object | `{}` |  |
+| service.labels | object | `{}` |  |
+| service.loadBalancerIP | string | `""` |  |
+| service.loadBalancerSourceRanges | list | `[]` |  |
+| service.nodePorts.http | string | `""` |  |
+| service.ports.http | string | `""` |  |
+| service.type | string | `"ClusterIP"` |  |
+| serviceAccount.annotations | object | `{}` |  |
+| serviceAccount.create | bool | `true` |  |
+| serviceAccount.imagePullSecrets | list | `[]` |  |
+| serviceAccount.labels | object | `{}` |  |
+| serviceAccount.name | string | `""` |  |
+| telemetry.enabled | bool | `true` | Set to false to opt out. Sets DO_NOT_TRACK=1 (https://donottrack.sh) on the backend and the console; the backend passes it on to the task and app pods it creates. |
+

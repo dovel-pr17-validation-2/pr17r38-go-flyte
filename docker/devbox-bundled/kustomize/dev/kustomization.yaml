@@ -1,0 +1,177 @@
+helmGlobals:
+  chartHome: ../../../../charts
+helmCharts:
+- name: flyte-devbox
+  releaseName: flyte-devbox
+  namespace: flyte
+  valuesInline:
+    flyte-binary:
+      enabled: false
+    # Disabled: PostgreSQL runs as an embedded process on the host via
+    # the fergusstrange/embedded-postgres library instead of a pod.
+    postgresql:
+      enabled: false
+    sandbox:
+      dev: true
+resources:
+- ../namespace.yaml
+- ../../../../charts/flyte-binary/templates/crds/flyte.org_taskactions.yaml
+- ../embedded-postgres-service.yaml
+- ../../../../charts/flyte-devbox/charts/knative-serving/crds/serving-crds.yaml
+
+patches:
+- patch: |-
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: config-network
+      namespace: knative-serving
+    data:
+      ingress-class: kourier.ingress.networking.knative.dev
+      domain-template: "{{.Name}}.{{.Domain}}"
+- patch: |-
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: config-domain
+      namespace: knative-serving
+    data:
+      "localhost": ""
+- patch: |-
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: config-deployment
+      namespace: knative-serving
+    data:
+      registries-skipping-tag-resolving: "localhost:30000,kind-registry:5000"
+      allow-http-registry: "true"
+- patch: |-
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: config-features
+      namespace: knative-serving
+    data:
+      # Allow apps (KServices) to mount pre-existing PVCs, e.g. warm model
+      # weights for serving. Off by default in Knative; required for the
+      # K8sPod app payload's persistentVolumeClaim volumes to pass validation.
+      kubernetes.podspec-persistent-volume-claim: "enabled"
+- patch: |-
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: config-autoscaler
+      namespace: knative-serving
+    data:
+      allow-zero-initial-scale: "true"
+- patch: |-
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: knative-serving-istio
+    $patch: delete
+- patch: |-
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: net-istio-webhook
+      namespace: knative-serving
+    $patch: delete
+- patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: net-istio-webhook
+      namespace: knative-serving
+    $patch: delete
+- patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: net-istio-controller
+      namespace: knative-serving
+    $patch: delete
+- patch: |-
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: config-istio
+      namespace: knative-serving
+    data:
+      local-gateway.knative-serving.knative-local-gateway: kourier-internal.kourier-system.svc.cluster.local
+- patch: |-
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: knative-local-gateway
+      namespace: istio-system
+    $patch: delete
+- patch: |-
+    apiVersion: networking.istio.io/v1beta1
+    kind: Gateway
+    metadata:
+      name: knative-local-gateway
+      namespace: knative-serving
+    $patch: delete
+- patch: |-
+    apiVersion: networking.istio.io/v1beta1
+    kind: Gateway
+    metadata:
+      name: knative-ingress-gateway
+      namespace: knative-serving
+    $patch: delete
+# net-istio also renders two PeerAuthentication CRs (security.istio.io); the
+# istio CRDs aren't installed in this kourier devbox, so without these deletes
+# k3s fails the whole flyte.yaml addon and the cluster never goes ready.
+- patch: |-
+    apiVersion: security.istio.io/v1beta1
+    kind: PeerAuthentication
+    metadata:
+      name: net-istio-webhook
+      namespace: knative-serving
+    $patch: delete
+- patch: |-
+    apiVersion: security.istio.io/v1beta1
+    kind: PeerAuthentication
+    metadata:
+      name: webhook
+      namespace: knative-serving
+    $patch: delete
+- target:
+    kind: Pod
+    name: rustfs-test-connection
+  patch: |
+    $patch: delete
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: rustfs-test-connection
+- patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: rustfs
+      namespace: flyte
+    spec:
+      template:
+        spec:
+          initContainers:
+          - name: create-default-buckets
+            image: busybox:stable
+            imagePullPolicy: IfNotPresent
+            command:
+            - sh
+            - -c
+            - |
+              chown -R 10001:10001 /data
+              mkdir -p /data/flyte-data
+              chown 10001:10001 /data/flyte-data
+            securityContext:
+              runAsUser: 0
+              runAsNonRoot: false
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+            volumeMounts:
+            - mountPath: /data
+              name: data

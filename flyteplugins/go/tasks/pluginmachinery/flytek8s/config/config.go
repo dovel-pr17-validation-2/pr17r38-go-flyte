@@ -1,0 +1,561 @@
+// Package config contains configuration for the flytek8s module - which is global configuration for all Flyte K8s interactions.
+// This config is under the subsection `k8s` and registered under the Plugin config
+// All K8s based plugins can optionally use the flytek8s module and this configuration allows controlling the defaults
+// For example if for every container execution if some default Environment Variables or Annotations should be used, then they can be configured here
+// An important configuration is ResourceTolerations that are applied to every container execution that needs some resource on the cluster
+package config
+
+import (
+	"maps"
+	"strings"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/config"
+	config2 "github.com/flyteorg/flyte/v2/flytestdlib/config"
+	"github.com/flyteorg/flyte/v2/flytestdlib/storage"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/core"
+)
+
+//go:generate pflags K8sPluginConfig --default-var=defaultK8sConfig
+
+const k8sPluginConfigSectionKey = "k8s"
+
+// ResourceNvidiaGPU is the name of the Nvidia GPU resource.
+// Copied from: k8s.io/autoscaler/cluster-autoscaler/utils/gpu/gpu.go
+const ResourceNvidiaGPU v1.ResourceName = "nvidia.com/gpu"
+
+var defaultCPURequest = resource.MustParse("1000m")
+var defaultMemoryRequest = resource.MustParse("1024Mi")
+
+var (
+	defaultK8sConfig = K8sPluginConfig{
+		DefaultAnnotations: map[string]string{
+			"cluster-autoscaler.kubernetes.io/safe-to-evict": "false",
+		},
+		CoPilot: FlyteCoPilotConfig{
+			NamePrefix: "flyte-copilot-",
+			// The flyte-copilot binary now ships inside the flyte single-binary
+			// image (at /bin/flyte-copilot), so default to that image rather than
+			// a separate flytecopilot image. Deployments normally override this.
+			Image:                "cr.flyte.org/flyteorg/flyte-binary-v2:latest",
+			DefaultInputDataPath: "/var/flyte/inputs",
+			InputVolumeName:      "flyte-inputs",
+			DefaultOutputPath:    "/var/flyte/outputs",
+			OutputVolumeName:     "flyte-outputs",
+			CPU:                  "500m",
+			Memory:               "128Mi",
+			Timeout: config2.Duration{
+				Duration: time.Hour * 1,
+			},
+		},
+		DefaultCPURequest:    defaultCPURequest,
+		DefaultMemoryRequest: defaultMemoryRequest,
+		CreateContainerErrorGracePeriod: config2.Duration{
+			Duration: time.Minute * 3,
+		},
+		CreateContainerConfigErrorGracePeriod: config2.Duration{
+			Duration: time.Minute * 0,
+		},
+		ImagePullBackoffGracePeriod: config2.Duration{
+			Duration: time.Minute * 3,
+		},
+		PodPendingTimeout: config2.Duration{
+			Duration: 0,
+		},
+		TerminatingResourceGracePeriod: config2.Duration{
+			Duration: time.Minute * 5,
+		},
+		GpuDeviceNodeLabel:        "k8s.amazonaws.com/accelerator",
+		GpuPartitionSizeNodeLabel: "k8s.amazonaws.com/gpu-partition-size",
+		GpuResourceName:           ResourceNvidiaGPU,
+		AcceleratorDevices: map[string]string{
+			// NVIDIA GPUs
+			"A2":            "nvidia-a2",
+			"A10":           "nvidia-a10",
+			"A10G":          "nvidia-a10g",
+			"A100":          "nvidia-tesla-a100",
+			"A100 80G":      "nvidia-a100-80gb",
+			"A100G":         "nvidia-a100g",
+			"B200":          "nvidia-b200",
+			"GB200":         "nvidia-gb200",
+			"H100":          "nvidia-h100",
+			"H100 80G":      "nvidia-h100-80gb",
+			"H100 MEGA 80G": "nvidia-h100-mega-80gb",
+			"H200":          "nvidia-h200",
+			"K80":           "nvidia-tesla-k80",
+			"L4":            "nvidia-l4",
+			"L40s":          "nvidia-l40s",
+			"L4_VWS":        "nvidia-l4-vws",
+			"M60":           "nvidia-tesla-m60",
+			"P4":            "nvidia-tesla-p4",
+			"P100":          "nvidia-tesla-p100",
+			"RTX PRO 4500":  "nvidia-rtx-pro-4500",
+			"RTX PRO 6000":  "nvidia-rtx-pro-6000",
+			"T4":            "nvidia-tesla-t4",
+			"V100":          "nvidia-tesla-v100",
+
+			// Time-sliced or MPS-shared NVIDIA GPUs. Nodes in a shared pool carry
+			// the plain model's label with a "-shared" suffix, so a task asking
+			// for a shared device lands only on those nodes.
+			"A10 SHARED":  "nvidia-a10-shared",
+			"A10G SHARED": "nvidia-a10g-shared",
+			"L4 SHARED":   "nvidia-l4-shared",
+			"L40S SHARED": "nvidia-l40s-shared",
+			"T4 SHARED":   "nvidia-tesla-t4-shared",
+
+			// Google Cloud TPUs
+			"V5E": "tpu-v5-lite-podslice",
+			"V5P": "tpu-v5p-slice",
+			"V6E": "tpu-v6e-slice",
+
+			// AWS Neuron
+			"INF1":  "aws-neuron-inf1",
+			"INF2":  "aws-neuron-inf2",
+			"TRN1":  "aws-neuron-trn1",
+			"TRN1N": "aws-neuron-trn1n",
+			"TRN2":  "aws-neuron-trn2",
+			"TRN2U": "aws-neuron-trn2u",
+
+			// AMD GPUs
+			"MI100":  "amd-mi100",
+			"MI210":  "amd-mi210",
+			"MI250":  "amd-mi250",
+			"MI250X": "amd-mi250x",
+			"MI300A": "amd-mi300a",
+			"MI300X": "amd-mi300x",
+			"MI325X": "amd-mi325x",
+			"MI350X": "amd-mi350x",
+			"MI355X": "amd-mi355x",
+
+			// Habana Gaudi (Intel)
+			"GAUDI1": "habana-gaudi-dl1",
+
+			// Canonical AcceleratorModel accelerator_name strings (flyteidl2
+			// core/tasks.proto). Each maps to the node label the SDK's current
+			// spelling of the same device resolves to above, so a task carrying the
+			// canonical string is placed exactly as one carrying the old spelling.
+			// Listed upper- and lower-cased; the lookup upper-cases its input.
+			"NVIDIA-K80":            "nvidia-tesla-k80",
+			"nvidia-k80":            "nvidia-tesla-k80",
+			"NVIDIA-M60":            "nvidia-tesla-m60",
+			"nvidia-m60":            "nvidia-tesla-m60",
+			"NVIDIA-P4":             "nvidia-tesla-p4",
+			"nvidia-p4":             "nvidia-tesla-p4",
+			"NVIDIA-P100":           "nvidia-tesla-p100",
+			"nvidia-p100":           "nvidia-tesla-p100",
+			"NVIDIA-V100":           "nvidia-tesla-v100",
+			"nvidia-v100":           "nvidia-tesla-v100",
+			"NVIDIA-T4":             "nvidia-tesla-t4",
+			"nvidia-t4":             "nvidia-tesla-t4",
+			"NVIDIA-A10":            "nvidia-a10",
+			"nvidia-a10":            "nvidia-a10",
+			"NVIDIA-A10G":           "nvidia-a10g",
+			"nvidia-a10g":           "nvidia-a10g",
+			"NVIDIA-A100":           "nvidia-tesla-a100",
+			"nvidia-a100":           "nvidia-tesla-a100",
+			"NVIDIA-A100-80GB":      "nvidia-a100-80gb",
+			"nvidia-a100-80gb":      "nvidia-a100-80gb",
+			"NVIDIA-L4":             "nvidia-l4",
+			"nvidia-l4":             "nvidia-l4",
+			"NVIDIA-L40S":           "nvidia-l40s",
+			"nvidia-l40s":           "nvidia-l40s",
+			"NVIDIA-H100":           "nvidia-tesla-h100",
+			"nvidia-h100":           "nvidia-tesla-h100",
+			"NVIDIA-H100-MEGA-80GB": "nvidia-h100-mega-80gb",
+			"nvidia-h100-mega-80gb": "nvidia-h100-mega-80gb",
+			"NVIDIA-H200":           "nvidia-h200",
+			"nvidia-h200":           "nvidia-h200",
+			"NVIDIA-B200":           "nvidia-b200",
+			"nvidia-b200":           "nvidia-b200",
+			"NVIDIA-GB200":          "nvidia-gb200",
+			"nvidia-gb200":          "nvidia-gb200",
+			"NVIDIA-GB10":           "GB10",
+			"nvidia-gb10":           "GB10",
+			"NVIDIA-RTX-PRO-6000":   "nvidia-rtx-pro-6000",
+			"nvidia-rtx-pro-6000":   "nvidia-rtx-pro-6000",
+			"NVIDIA-RTX-PRO-4500":   "nvidia-rtx-pro-4500",
+			"nvidia-rtx-pro-4500":   "nvidia-rtx-pro-4500",
+			"GOOGLE-TPU-V5E":        "tpu-v5-lite-podslice",
+			"google-tpu-v5e":        "tpu-v5-lite-podslice",
+			"GOOGLE-TPU-V5P":        "tpu-v5p-slice",
+			"google-tpu-v5p":        "tpu-v5p-slice",
+			"GOOGLE-TPU-V6E":        "tpu-v6e-slice",
+			"google-tpu-v6e":        "tpu-v6e-slice",
+			"AWS-INF1":              "aws-neuron-inf1",
+			"aws-inf1":              "aws-neuron-inf1",
+			"AWS-INF2":              "aws-neuron-inf2",
+			"aws-inf2":              "aws-neuron-inf2",
+			"AWS-TRN1":              "aws-neuron-trn1",
+			"aws-trn1":              "aws-neuron-trn1",
+			"AWS-TRN1N":             "aws-neuron-trn1n",
+			"aws-trn1n":             "aws-neuron-trn1n",
+			"AWS-TRN2":              "aws-neuron-trn2",
+			"aws-trn2":              "aws-neuron-trn2",
+			"AWS-TRN2U":             "aws-neuron-trn2u",
+			"aws-trn2u":             "aws-neuron-trn2u",
+			"AMD-MI100":             "amd-mi100",
+			"amd-mi100":             "amd-mi100",
+			"AMD-MI210":             "amd-mi210",
+			"amd-mi210":             "amd-mi210",
+			"AMD-MI250":             "amd-mi250",
+			"amd-mi250":             "amd-mi250",
+			"AMD-MI250X":            "amd-mi250x",
+			"amd-mi250x":            "amd-mi250x",
+			"AMD-MI300A":            "amd-mi300a",
+			"amd-mi300a":            "amd-mi300a",
+			"AMD-MI300X":            "amd-mi300x",
+			"amd-mi300x":            "amd-mi300x",
+			"AMD-MI325X":            "amd-mi325x",
+			"amd-mi325x":            "amd-mi325x",
+			"AMD-MI350X":            "amd-mi350x",
+			"amd-mi350x":            "amd-mi350x",
+			"AMD-MI355X":            "amd-mi355x",
+			"amd-mi355x":            "amd-mi355x",
+			"HABANA-GAUDI1":         "habana-gaudi-dl1",
+			"habana-gaudi1":         "habana-gaudi-dl1",
+		},
+		AcceleratorDeviceClasses: map[string]AcceleratorDeviceClassConfig{
+			core.GPUAccelerator_NVIDIA_GPU.String(): {
+				ResourceName: "nvidia.com/gpu",
+			},
+			core.GPUAccelerator_GOOGLE_TPU.String(): {
+				ResourceName:           "google.com/tpu",
+				DeviceNodeLabel:        "cloud.google.com/gke-tpu-accelerator",
+				PartitionSizeNodeLabel: "cloud.google.com/gke-tpu-topology",
+			},
+			core.GPUAccelerator_AMAZON_NEURON.String(): {
+				ResourceName: "aws.amazon.com/neuron",
+			},
+			core.GPUAccelerator_AMD_GPU.String(): {
+				ResourceName: "amd.com/gpu",
+			},
+			core.GPUAccelerator_HABANA_GAUDI.String(): {
+				ResourceName: "habana.ai/gaudi",
+			},
+			// No resource name: the Apple Silicon GPU is reached through the devbox's host
+			// Apple Silicon bridge (see AppleSiliconBridge), never through a device plugin.
+			core.GPUAccelerator_APPLE_SILICON.String(): {},
+		},
+		DefaultPodTemplateResync: config2.Duration{
+			Duration: 30 * time.Second,
+		},
+		UpdateBaseBackoffDuration:          10,
+		UpdateBackoffRetries:               5,
+		AddTolerationsForExtendedResources: []string{},
+	}
+
+	// K8sPluginConfigSection provides a singular top level config section for all plugins.
+	// If you are a plugin developer writing a k8s plugin, register your config section as a subsection to this.
+	K8sPluginConfigSection = config.MustRegisterSubSection(k8sPluginConfigSectionKey, &defaultK8sConfig)
+
+	// defaultAcceleratorDevices is the built-in accelerator device map with upper-cased keys. Configured
+	// accelerator devices are merged over it, so setting one entry does not drop the rest.
+	defaultAcceleratorDevices = upperCaseKeys(defaultK8sConfig.AcceleratorDevices)
+)
+
+// K8sPluginConfig should be used to configure per-pod defaults for the entire platform. This allows adding global defaults
+// for pods that are being launched. For example, default annotations, labels, if a finalizer should be injected,
+// if taints/tolerations should be used for certain resource types etc.
+type K8sPluginConfig struct {
+	// InjectFinalizer is a boolean flag that indicates if a finalizer should be injected into every K8s resource launched
+	InjectFinalizer bool `json:"inject-finalizer" pflag:",Instructs the plugin to inject a finalizer on startTask and remove it on task termination."`
+
+	// -------------------------------------------------------------------------------------------------------------
+	// Default Configurations to be applied to all Pods launched by Flyte. These are always applied to every Pod.
+	// Thus if a Pod is interruptible, it will have the default + interruptible tolerations
+
+	// Provide default annotations that should be added to K8s resource
+	DefaultAnnotations map[string]string `json:"default-annotations" pflag:"-,Defines a set of default annotations to add to the produced pods."`
+	// Provide default labels that should be added to K8s resource
+	DefaultLabels map[string]string `json:"default-labels" pflag:"-,Defines a set of default labels to add to the produced pods."`
+	// Provide additional environment variable pairs that plugin authors will provide to containers
+	DefaultEnvVars map[string]string `json:"default-env-vars" pflag:"-,Additional environment variable that should be injected into every resource"`
+	// Provide additional environment variable pairs whose values resolve from the plugin's execution environment.
+	DefaultEnvVarsFromEnv map[string]string `json:"default-env-vars-from-env" pflag:"-,Additional environment variable that should be injected into every resource"`
+	// Provide additional environment variable parts from configMaps
+	DefaultEnvFromConfigMaps []string `json:"default-env-from-configmaps" pflag:"-,Additional environment variable sets that should be injected into each pod from these configMaps"`
+	// Provide additional environment variable parts from secrets
+	DefaultEnvFromSecrets []string `json:"default-env-from-secrets" pflag:"-,Additional environment variable sets that should be injected into each pod from these secret"`
+
+	// default cpu requests for a container
+	DefaultCPURequest resource.Quantity `json:"default-cpus" pflag:",Defines a default value for cpu for containers if not specified."`
+	// default memory requests for a container
+	DefaultMemoryRequest resource.Quantity `json:"default-memory" pflag:",Defines a default value for memory for containers if not specified."`
+
+	// Default Tolerations that will be added to every Pod that is created by Flyte. These can be used in heterogeneous clusters, where one wishes to keep all pods created by Flyte on a separate
+	// set of nodes.
+	DefaultTolerations []v1.Toleration `json:"default-tolerations"  pflag:"-,Tolerations to be applied for every node that is launched by Flyte. Useful in non dedicated flyte clusters"`
+	// Default Node Selector Labels for pods. These NodeSelector labels are added to all pods, created by Flyte, unless they are marked as interruptible (default of interruptible are different).
+	DefaultNodeSelector map[string]string `json:"default-node-selector" pflag:"-,Defines a set of node selector labels to add to the all pods launched by Flyte. Useful in non dedicated Flyte clusters"`
+	// Default Affinity that is applied to every pod that Flyte launches
+	DefaultAffinity *v1.Affinity `json:"default-affinity,omitempty" pflag:"-,Defines default Affinity to be added for every Pod launched by Flyte. Useful in non dedicated Flyte clusters"`
+
+	// Default scheduler that should be used for all pods or CRD that accept Scheduler name.
+	SchedulerName string `json:"scheduler-name" pflag:",Defines scheduler name."`
+
+	// -----------------------------------------------------------------
+	// Special tolerations and node selector for Interruptible tasks. This allows scheduling interruptible tasks onto specific hardware
+
+	// Tolerations for interruptible k8s pods: These tolerations are added to the pods that can tolerate getting evicted from a node. We
+	// can leverage this for better bin-packing and using low-reliability cheaper machines.
+	InterruptibleTolerations []v1.Toleration `json:"interruptible-tolerations"  pflag:"-,Tolerations to be applied for interruptible pods"`
+	// Node Selector Labels for interruptible pods: Similar to InterruptibleTolerations, these node selector labels are added for pods that can tolerate
+	// eviction.
+	// Deprecated: Please use InterruptibleNodeSelectorRequirement/NonInterruptibleNodeSelectorRequirement
+	InterruptibleNodeSelector map[string]string `json:"interruptible-node-selector" pflag:"-,Defines a set of node selector labels to add to the interruptible pods."`
+	// Node Selector Requirements to be added to interruptible and non-interruptible
+	// pods respectively
+	InterruptibleNodeSelectorRequirement    *v1.NodeSelectorRequirement `json:"interruptible-node-selector-requirement" pflag:"-,Node selector requirement to add to interruptible pods"`
+	NonInterruptibleNodeSelectorRequirement *v1.NodeSelectorRequirement `json:"non-interruptible-node-selector-requirement" pflag:"-,Node selector requirement to add to non-interruptible pods"`
+
+	// ----------------------------------------------------------------------
+	// Specific tolerations that are added for certain resources. Useful for maintaining gpu resources separate in the cluster
+
+	// Tolerations in the cluster that should be applied for a specific resource
+	// Currently we support simple resource based tolerations only
+	ResourceTolerations map[v1.ResourceName][]v1.Toleration `json:"resource-tolerations"  pflag:"-,Default tolerations to be applied for resource of type 'key'"`
+
+	// Flyte CoPilot Configuration
+	CoPilot FlyteCoPilotConfig `json:"co-pilot" pflag:",Co-Pilot Configuration"`
+
+	// DeleteResourceOnFinalize instructs the system to delete the resource on finalize. This ensures that no resources
+	// are kept around (potentially consuming cluster resources). This, however, will cause k8s log links to expire as
+	// soon as the resource is finalized.
+	DeleteResourceOnFinalize bool `json:"delete-resource-on-finalize" pflag:",Instructs the system to delete the resource upon successful execution of a k8s pod rather than have the k8s garbage collector clean it up. This ensures that no resources are kept around (potentially consuming cluster resources). This, however, will cause k8s log links to expire as soon as the resource is finalized."`
+
+	// Time to wait for transient CreateContainerError errors to be resolved. If the
+	// error persists past this grace period, it will be inferred to be a permanent
+	// one, and the corresponding task marked as failed
+	CreateContainerErrorGracePeriod config2.Duration `json:"create-container-error-grace-period" pflag:"-,Time to wait for transient CreateContainerError errors to be resolved."`
+
+	// Time to wait for transient CreateContainerConfigError errors to be resolved. If the
+	// error persists past this grace period, it will be inferred to be a permanent error.
+	// The pod will be deleted, and the corresponding task marked as failed.
+	CreateContainerConfigErrorGracePeriod config2.Duration `json:"create-container-config-error-grace-period" pflag:"-,Time to wait for transient CreateContainerConfigError errors to be resolved."`
+
+	// Time to wait for transient ImagePullBackoff errors to be resolved. If the
+	// error persists past this grace period, it will be inferred to be a permanent
+	// one, and the corresponding task marked as failed
+	ImagePullBackoffGracePeriod config2.Duration `json:"image-pull-backoff-grace-period" pflag:"-,Time to wait for transient ImagePullBackoff errors to be resolved."`
+
+	// ImagePullPolicy for the submitted pod.
+	ImagePullPolicy v1.PullPolicy `json:"image-pull-policy" pflag:"-,Image pull policy for all k8s pods created by FlytePropeller."`
+
+	// Time to wait while pod is in pending phase. If the pod is stuck in
+	// pending phase past this timeout, it will be inferred to be a permanent
+	// issue, and the corresponding task marked as failed
+	PodPendingTimeout config2.Duration `json:"pod-pending-timeout" pflag:"-,Time to wait while pod is stuck in pending."`
+
+	// Time a relaunch waits, past the end of its deletion grace period, for a previous
+	// incarnation of the resource still holding its name to go away. A resource stuck
+	// terminating longer than this (an unreachable node, a finalizer that never clears)
+	// fails the launch with a system-retryable error instead of waiting forever. Zero
+	// waits indefinitely.
+	TerminatingResourceGracePeriod config2.Duration `json:"terminating-resource-grace-period" pflag:"-,Time to wait past its deletion grace period for a previous resource stuck terminating before failing the launch."`
+
+	// The node label that specifies the attached GPU device.
+	GpuDeviceNodeLabel string `json:"gpu-device-node-label" pflag:"-,The node label that specifies the attached GPU device."`
+
+	// The node label that specifies the attached GPU partition size.
+	GpuPartitionSizeNodeLabel string `json:"gpu-partition-size-node-label" pflag:"-,The node label that specifies the attached GPU partition size."`
+
+	// Override for node selector requirement added to pods intended for unpartitioned GPU nodes.
+	GpuUnpartitionedNodeSelectorRequirement *v1.NodeSelectorRequirement `json:"gpu-unpartitioned-node-selector-requirement" pflag:"-,Override for node selector requirement added to pods intended for unpartitioned GPU nodes."`
+
+	// Toleration added to pods intended for unpartitioned GPU nodes.
+	GpuUnpartitionedToleration *v1.Toleration `json:"gpu-unpartitioned-toleration" pflag:"-,Toleration added to pods intended for unpartitioned GPU nodes."`
+
+	// Deprecated: Use AcceleratorDeviceClasses instead. The name of the GPU resource to use when the task resource requests GPUs.
+	GpuResourceName v1.ResourceName `json:"gpu-resource-name" pflag:"-,The name of the GPU resource to use when the task resource requests GPUs."`
+
+	// AcceleratorDevices maps accelerator devices to provisioned Kubernetes node labels.
+	AcceleratorDevices map[string]string `json:"accelerator-devices" pflag:"-,Maps accelerator devices to provisionedKubernetes node labels."`
+
+	// AcceleratorDeviceClasses maps accelerator device classes to their configuration overrides.
+	// This allows configuring resource names, node labels, and tolerations for different accelerator types (NVIDIA GPU, Google TPU, Amazon Neuron, AMD GPU).
+	AcceleratorDeviceClasses map[string]AcceleratorDeviceClassConfig `json:"accelerator-device-classes" pflag:"-,Maps accelerator device classes to their configuration overrides."`
+
+	// DefaultPodSecurityContext provides a default pod security context that should be applied for every pod that is launched by FlytePropeller. This may not be applicable to all plugins. For
+	// downstream plugins - i.e. TensorflowOperators may not support setting this, but Spark does.
+	DefaultPodSecurityContext *v1.PodSecurityContext `json:"default-pod-security-context" pflag:"-,Optionally specify any default pod security context that should be applied to every Pod launched by FlytePropeller."`
+
+	// DefaultSecurityContext provides a default container security context that should be applied for the primary container launched and created by FlytePropeller. This may not be applicable to all plugins. For
+	//	// downstream plugins - i.e. TensorflowOperators may not support setting this, but Spark does.
+	DefaultSecurityContext *v1.SecurityContext `json:"default-security-context" pflag:"-,Optionally specify a default security context that should be applied to every container launched/created by FlytePropeller. This will not be applied to plugins that do not support it or to user supplied containers in pod tasks."`
+
+	// EnableHostNetworkingPod is a binary switch to enable `hostNetwork: true` for all pods launched by Flyte.
+	// Refer to - https://kubernetes.io/docs/concepts/policy/pod-security-policy/#host-namespaces.
+	// As a follow up, the default pod configurations will now be adjusted using podTemplates per namespace
+	EnableHostNetworkingPod *bool `json:"enable-host-networking-pod" pflag:"-,If true, will schedule all pods with hostNetwork: true."`
+
+	// DefaultPodDNSConfig provides a default pod DNS config that that should be applied for the primary container launched and created by FlytePropeller. This may not be applicable to all plugins. For
+	//	// downstream plugins - i.e. TensorflowOperators may not support setting this.
+	DefaultPodDNSConfig *v1.PodDNSConfig `json:"default-pod-dns-config" pflag:"-,Optionally specify a default DNS config that should be applied to every Pod launched by FlytePropeller."`
+
+	// DefaultPodTemplateName that serves as the base PodTemplate for all k8s pods (including
+	// individual containers) that are creating by FlytePropeller.
+	DefaultPodTemplateName string `json:"default-pod-template-name" pflag:",Name of the PodTemplate to use as the base for all k8s pods created by FlytePropeller."`
+
+	// DefaultPodTemplateResync defines the frequency at which the k8s informer resyncs the default
+	// pod template resources.
+	DefaultPodTemplateResync config2.Duration `json:"default-pod-template-resync" pflag:",Frequency of resyncing default pod templates"`
+
+	// SendObjectEvents indicates whether to send k8s object events in TaskExecutionEvent updates (similar to kubectl get events).
+	SendObjectEvents bool `json:"send-object-events" pflag:",If true, will send k8s object events in TaskExecutionEvent updates."`
+
+	// Initial delay in exponential backoff when updating a resource in milliseconds.
+	UpdateBaseBackoffDuration int `json:"update-base-backoff-duration" pflag:",Initial delay in exponential backoff when updating a resource in milliseconds."`
+
+	// Number of retries for exponential backoff when updating a resource.
+	UpdateBackoffRetries int `json:"update-backoff-retries" pflag:",Number of retries for exponential backoff when updating a resource."`
+
+	// Extended resources that should be added to the tolerations automatically.
+	AddTolerationsForExtendedResources []string `json:"add-tolerations-for-extended-resources" pflag:",Name of the extended resources for which tolerations should be added."`
+
+	// DisableInjectOwnerReferences is a boolean flag that indicates if owner references should be injected into the k8s resources.
+	DisableInjectOwnerReferences bool `json:"disable-inject-owner-references" pflag:",Override to not set owner references on k8s resources. This is useful for V2 node execution"`
+
+	// AppleSiliconBridge configures the devbox-local Apple Silicon accelerator. It is only
+	// set by a devbox running on an Apple Silicon host; everywhere else it stays empty and a
+	// workload requesting the APPLE_SILICON device class fails with APPLE_SILICON_NOT_AVAILABLE.
+	AppleSiliconBridge AppleSiliconBridgeConfig `json:"apple-silicon-bridge" pflag:"-,Devbox-local Apple Silicon bridge configuration."`
+}
+
+// AppleSiliconBridgeConfig points Apple Silicon workloads at the host-side Apple Silicon bridge a devbox runs on an
+// Apple Silicon Mac. Pods cannot reach the host's Metal GPU, so instead of scheduling against a
+// device plugin they are handed the bridge's OpenAI-compatible endpoint and a per-workload token.
+type AppleSiliconBridgeConfig struct {
+	// Endpoint is the bridge's base URL as reachable from pods, e.g. http://192.168.65.254:30090.
+	// Empty means this backend has no Apple Silicon bridge.
+	Endpoint string `json:"endpoint"`
+	// TokenSecret is the HMAC key shared with the bridge, used to mint each workload's credential.
+	TokenSecret string `json:"token-secret"`
+	// HostPlatform is the devbox host's os/arch (e.g. darwin/arm64, linux/amd64), quoted in the
+	// APPLE_SILICON_NOT_AVAILABLE message so the user sees why their host cannot provide Apple Silicon.
+	HostPlatform string `json:"host-platform"`
+}
+
+// FlyteCoPilotConfig specifies configuration for the Flyte CoPilot system. FlyteCoPilot, allows running flytekit-less containers
+// in K8s, where the IO is managed by the FlyteCoPilot sidecar process.
+type FlyteCoPilotConfig struct {
+	// Co-pilot sidecar container name
+	NamePrefix string `json:"name" pflag:",Flyte co-pilot sidecar container name prefix. (additional bits will be added after this)"`
+	// Docker image FQN where co-pilot binary is installed
+	Image string `json:"image" pflag:",Flyte co-pilot Docker Image FQN"`
+	// Default Input Path for every task execution that uses co-pilot. This is used only if a input path is not provided by the user and inputs are required for the task
+	DefaultInputDataPath string `json:"default-input-path" pflag:",Default path where the volume should be mounted"`
+	// Default Output Path for every task execution that uses co-pilot. This is used only if a output path is not provided by the user and outputs are required for the task
+	DefaultOutputPath string `json:"default-output-path" pflag:",Default path where the volume should be mounted"`
+	// Name of the input volume
+	InputVolumeName string `json:"input-vol-name" pflag:",Name of the data volume that is created for storing inputs"`
+	// Name of the output volume
+	OutputVolumeName string `json:"output-vol-name" pflag:",Name of the data volume that is created for storing outputs"`
+	// Time for which the sidecar container should wait after starting up, for the primary process to appear. If it does not show up in this time
+	// the process will be assumed to be dead or in a terminal condition and will trigger an abort.
+	StartTimeout config2.Duration `json:"start-timeout" pflag:"-,Time for which the sidecar should wait on startup before assuming the primary container to have failed startup."`
+	// Timeout for upload
+	Timeout config2.Duration `json:"timeout" pflag:"-,Max time to allow for uploads to complete."`
+	// Resources for CoPilot Containers
+	CPU     string `json:"cpu" pflag:",Used to set cpu for co-pilot containers"`
+	Memory  string `json:"memory" pflag:",Used to set memory for co-pilot containers"`
+	Storage string `json:"storage" pflag:",Default storage limit for individual inputs / outputs"`
+	// Setting this puts the stow config back on the co-pilot command line even when
+	// StorageConfigSecretName is set — see CopilotCommandArgs.
+	StorageConfigOverride *storage.Config `json:"storage-config-override" pflag:"-,Override for the storage config to use for co-pilot"`
+	// Name of the Secret holding co-pilot's whole storage configuration, projected into the
+	// co-pilot containers so the credentials stay out of the pod spec. Empty falls back to
+	// passing the stow config on the command line.
+	StorageConfigSecretName string `json:"storage-config-secret-name" pflag:",Name of the Secret holding co-pilot's storage configuration"`
+}
+
+type AcceleratorDeviceClassConfig struct {
+	// Kubernetes resource name for the accelerator device class.
+	ResourceName v1.ResourceName `json:"resource-name" pflag:",Kubernetes resource name for the accelerator device class."`
+
+	// The node label that specifies the attached accelerator device.
+	DeviceNodeLabel string `json:"device-node-label" pflag:"-,The node label that specifies the attached device."`
+
+	// The node label that specifies the attached accelerator partition size.
+	PartitionSizeNodeLabel string `json:"partition-size-node-label" pflag:"-,The node label that specifies the attached partition size."`
+
+	// Optional template for the Kubernetes resource name a task requests when it asks for a
+	// specific partition of this device class. Every "{partition}" in the template is replaced
+	// with the task's partition size, so "nvidia.com/mig-{partition}" turns a 1g.5gb partition
+	// into a request for nvidia.com/mig-1g.5gb. Set it on clusters whose NVIDIA device plugin runs
+	// with migStrategy=mixed, which offers each MIG profile as its own resource. A partitioned
+	// request then asks for the rendered name in place of ResourceName, with the same count, and
+	// gets no partition size node affinity or toleration, because only nodes that offer that
+	// profile can satisfy the resource. Requests without a partition size still use ResourceName.
+	PartitionResourceName string `json:"partition-resource-name" pflag:"-,Template for the resource name requested for a partition, such as nvidia.com/mig-{partition}."`
+
+	// Override for node selector requirement added to pods intended for unpartitioned nodes.
+	UnpartitionedNodeSelectorRequirement *v1.NodeSelectorRequirement `json:"unpartitioned-node-selector-requirement" pflag:"-,Override for node selector requirement added to pods intended for unpartitioned nodes."`
+
+	// Toleration added to pods intended for unpartitioned nodes.
+	UnpartitionedToleration *v1.Toleration `json:"unpartitioned-toleration" pflag:"-,Toleration added to pods intended for unpartitioned nodes."`
+
+	// PodTemplate provides device-class-specific defaults for pods using this accelerator.
+	// Platform operators can define pod-level and container-level configuration that serves
+	// as a base template for tasks using this device class. Task-specific configurations
+	// can override these defaults.
+	//
+	// Precedence (lowest to highest):
+	//   1. Base PodTemplate (cluster/namespace defaults)
+	//   2. Device Class PodTemplate (this config) - device-specific defaults
+	//   3. Task PodSpec - task-specific values override device class for scalars
+	//
+	// Merge behavior (BASE semantics):
+	//   - Scalar fields: Task values WIN (device class provides defaults only)
+	//     Examples: schedulerName, dnsPolicy, hostNetwork
+	//   - Slice fields: Appended (device class values + task values)
+	//     Examples: tolerations, volumes, env vars
+	//   - Map fields: Merged (union with task values winning on conflicts)
+	//     Examples: nodeSelector, labels, annotations
+	//
+	// Container (and init container) template support:
+	//   - Containers named "default" provide defaults for ALL containers
+	//   - Containers named "primary" provide defaults for the primary container only
+	//   - Primary template is applied after default (primary wins for conflicts)
+	//   - Containers with other names are merged into containers in the base PodSpec with the same name
+	//   - Uses the same container template merging as base PodTemplates
+	PodTemplate *v1.PodTemplate `json:"pod-template" pflag:"-,PodTemplate providing defaults for this accelerator device class."`
+}
+
+// GetK8sPluginConfig retrieves the current k8s plugin config or default.
+func GetK8sPluginConfig() *K8sPluginConfig {
+	cfg := K8sPluginConfigSection.GetConfig().(*K8sPluginConfig)
+
+	// Viper casts all keys in YAML configs to lowercase, but all the accelerator device classes should be uppercase.
+	// See: https://github.com/spf13/viper/issues/260
+	acceleratorDeviceClasses := make(map[string]AcceleratorDeviceClassConfig)
+	for key, value := range cfg.AcceleratorDeviceClasses {
+		acceleratorDeviceClasses[strings.ToUpper(key)] = value
+	}
+	cfg.AcceleratorDeviceClasses = acceleratorDeviceClasses
+
+	// The config loader replaces the default accelerator device map instead of merging into it, and viper lowercases
+	// its keys. Merge the configured entries over the defaults with upper-cased keys to match the lookup.
+	acceleratorDevices := maps.Clone(defaultAcceleratorDevices)
+	for name, label := range cfg.AcceleratorDevices {
+		acceleratorDevices[strings.ToUpper(name)] = label
+	}
+	cfg.AcceleratorDevices = acceleratorDevices
+
+	return cfg
+}
+
+func upperCaseKeys(m map[string]string) map[string]string {
+	upper := make(map[string]string, len(m))
+	for key, value := range m {
+		upper[strings.ToUpper(key)] = value
+	}
+	return upper
+}
+
+// SetK8sPluginConfig should be used for TESTING ONLY, It Sets current value for the config.
+func SetK8sPluginConfig(cfg *K8sPluginConfig) error {
+	return K8sPluginConfigSection.SetConfig(cfg)
+}

@@ -1,0 +1,330 @@
+package plugin
+
+import (
+	"fmt"
+	"strconv"
+
+	"google.golang.org/protobuf/proto"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+
+	flyteorgv1 "github.com/flyteorg/flyte/v2/executor/api/v1"
+	executorconfig "github.com/flyteorg/flyte/v2/executor/pkg/config"
+	pluginsCore "github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/core"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/encoding"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/flytek8s"
+	flytesecret "github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/secret"
+	pluginsUtils "github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/utils"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/utils/secrets"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/core"
+)
+
+var _ pluginsCore.TaskExecutionMetadata = &taskExecutionMetadata{}
+var _ pluginsCore.TaskExecutionID = &taskExecutionID{}
+
+// Labels stamped on task pods so external per-pod metrics (DCGM, cAdvisor,
+// kube-state-metrics) can be joined back to Flyte semantics, and so the framework can
+// find the pods belonging to one attempt of one action. They are defined in flytek8s
+// alongside the managed label, because the plugins that build pod templates have to keep
+// them intact for the pods an operator derives from those templates to carry them.
+const (
+	RunLabel      = flytek8s.RunLabel
+	ActionLabel   = flytek8s.ActionLabel
+	AttemptLabel  = flytek8s.AttemptLabel
+	TaskNameLabel = flytek8s.TaskNameLabel
+)
+
+type taskExecutionID struct {
+	generatedName string
+	id            core.TaskExecutionIdentifier
+}
+
+func (t *taskExecutionID) GetGeneratedName() string {
+	return t.generatedName
+}
+
+func (t *taskExecutionID) GetGeneratedNameWith(minLength, maxLength int) (string, error) {
+	return encoding.FixedLengthUniqueID(t.generatedName, maxLength)
+}
+
+func (t *taskExecutionID) GetID() *core.TaskExecutionIdentifier {
+	return &t.id
+}
+
+func (t *taskExecutionID) GetUniqueNodeID() string {
+	return t.generatedName
+}
+
+type taskExecutionMetadata struct {
+	ownerID         types.NamespacedName
+	taskExecutionID pluginsCore.TaskExecutionID
+	namespace       string
+	ownerReference  metav1.OwnerReference
+	labels          map[string]string
+	annotations     map[string]string
+	maxAttempts     uint32
+	overrides       pluginsCore.TaskOverrides
+	envVars         map[string]string
+	interruptible   bool
+	securityContext *core.SecurityContext
+	serviceAccount  string
+}
+
+func resolveServiceAccount(securityContext *core.SecurityContext, defaultSA string) string {
+	if sa := securityContext.GetRunAs().GetK8SServiceAccount(); sa != "" {
+		return sa
+	}
+	return defaultSA
+}
+
+// NewTaskExecutionMetadata creates a TaskExecutionMetadata from a TaskAction.
+func NewTaskExecutionMetadata(ta *flyteorgv1.TaskAction) (pluginsCore.TaskExecutionMetadata, error) {
+	// Extract resource requirements from the inline task template
+	overrides := buildOverridesFromTaskTemplate(ta.Spec.TaskTemplate)
+
+	// Handling secrets
+	var err error
+	securityContext := extractSecurityContextFromTaskTemplate(ta.Spec.TaskTemplate)
+	secretsMap := make(map[string]string)
+	injectLabels := map[string]string{
+		// Flyte OSS v2 has no organization concept, but the secret fetcher
+		// still requires an organization label on the pod. Inject a stable
+		// dummy value so scoped secret lookups succeed.
+		flytesecret.OrganizationLabel: flytesecret.DefaultOrganization,
+		flytesecret.ProjectLabel:      ta.Spec.Project,
+		flytesecret.DomainLabel:       ta.Spec.Domain,
+		// Marks every Pod this executor is responsible for, including the ones
+		// operators expand from the Pod templates embedded in a plugin's CRD.
+		// The manager cache selects on this label, so a Pod that does not carry
+		// it is invisible to the executor. Plugins merge these labels into the
+		// Pod templates they build, so setting it here covers all of them.
+		flytek8s.ManagedLabelKey: flytek8s.ManagedLabelValue,
+	}
+	if securityContext != nil && len(securityContext.Secrets) > 0 {
+		secretsMap, err = secrets.MarshalSecretsToMapStrings(securityContext.Secrets)
+		if err != nil {
+			return nil, err
+		}
+		injectLabels[secrets.PodLabel] = secrets.PodLabelValue
+	}
+
+	// Build environment variables for the task pod
+	envVars := map[string]string{
+		"ACTION_NAME": ta.Spec.ActionName,
+		"RUN_NAME":    ta.Spec.RunName,
+		"_U_RUN_BASE": ta.Spec.RunOutputBase,
+		"_U_ORG_NAME": "local",
+	}
+	for key, value := range ta.Spec.EnvVars {
+		if _, exists := envVars[key]; !exists {
+			envVars[key] = value
+		}
+	}
+	generatedName := buildGeneratedName(ta)
+	retryAttempt := attemptToRetry(ta.Status.Attempts)
+	maxAttempts := maxAttemptsFromTaskTemplate(ta.Spec.TaskTemplate)
+	taskID := taskIDFromTaskTemplate(ta.Spec.TaskTemplate)
+
+	// Identify the pod in Flyte terms so per-pod metric series can be joined back to
+	// the run, action and attempt that produced them.
+	setSanitizedLabel(injectLabels, RunLabel, ta.Spec.RunName)
+	setSanitizedLabel(injectLabels, ActionLabel, ta.Spec.ActionName)
+	injectLabels[AttemptLabel] = strconv.FormatUint(uint64(retryAttempt)+1, 10)
+	setSanitizedLabel(injectLabels, TaskNameLabel, taskID.GetName())
+
+	interruptible := ta.Spec.Interruptible
+	if interruptible == nil {
+		interruptible = interruptibleFromTaskTemplate(ta.Spec.TaskTemplate)
+	}
+
+	return &taskExecutionMetadata{
+		ownerID: types.NamespacedName{
+			Name:      ta.Name,
+			Namespace: ta.Namespace,
+		},
+		taskExecutionID: &taskExecutionID{
+			generatedName: generatedName,
+			id: core.TaskExecutionIdentifier{
+				NodeExecutionId: &core.NodeExecutionIdentifier{
+					ExecutionId: &core.WorkflowExecutionIdentifier{
+						Project: ta.Spec.Project,
+						Domain:  ta.Spec.Domain,
+						Name:    ta.Spec.RunName,
+					},
+					NodeId: ta.Spec.ActionName,
+				},
+				RetryAttempt: retryAttempt,
+				TaskId:       taskID,
+			},
+		},
+		namespace: ta.Namespace,
+		ownerReference: metav1.OwnerReference{
+			APIVersion: flyteorgv1.GroupVersion.String(),
+			Kind:       "TaskAction",
+			Name:       ta.Name,
+			UID:        ta.UID,
+			Controller: ptr.To(true),
+		},
+		labels:          pluginsUtils.UnionMaps(ta.Labels, injectLabels),
+		annotations:     pluginsUtils.UnionMaps(ta.Annotations, secretsMap),
+		maxAttempts:     maxAttempts,
+		overrides:       overrides,
+		envVars:         envVars,
+		interruptible:   interruptible != nil && *interruptible,
+		securityContext: securityContext,
+		serviceAccount:  resolveServiceAccount(securityContext, executorconfig.GetConfig().DefaultK8sServiceAccount),
+	}, nil
+}
+
+// setSanitizedLabel stamps a label only when the value survives sanitization, so pods
+// never carry an empty label that would look like a real, blank value to a metrics query.
+func setSanitizedLabel(labels map[string]string, key, value string) {
+	if sanitized := pluginsUtils.SanitizeLabelValue(value); sanitized != "" {
+		labels[key] = sanitized
+	}
+}
+
+func buildGeneratedName(ta *flyteorgv1.TaskAction) string {
+	return fmt.Sprintf("%s-%d", ta.Name, attemptToRetry(ta.Status.Attempts))
+}
+
+// attemptToRetry convert attempt to retry count
+func attemptToRetry(attempt uint32) uint32 {
+	if attempt <= 1 {
+		return 0
+	}
+	return attempt - 1
+}
+
+// interruptibleFromTaskTemplate gives the task template's interruptible flag, or nil when the
+// template does not declare one.
+func interruptibleFromTaskTemplate(data []byte) *bool {
+	if len(data) == 0 {
+		return nil
+	}
+
+	tmpl := &core.TaskTemplate{}
+	if err := proto.Unmarshal(data, tmpl); err != nil {
+		return nil
+	}
+
+	md := tmpl.GetMetadata()
+	if md == nil || md.GetInterruptibleValue() == nil {
+		return nil
+	}
+
+	return ptr.To(md.GetInterruptible())
+}
+
+// maxAttemptsFromTaskTemplate give the max attempts (retries + 1) from the task template.
+func maxAttemptsFromTaskTemplate(data []byte) uint32 {
+	if len(data) == 0 {
+		return 1
+	}
+
+	tmpl := &core.TaskTemplate{}
+	if err := proto.Unmarshal(data, tmpl); err != nil {
+		return 1
+	}
+
+	md := tmpl.GetMetadata()
+	if md == nil || md.GetRetries() == nil {
+		return 1
+	}
+
+	return md.GetRetries().GetRetries() + 1
+}
+
+func taskIDFromTaskTemplate(data []byte) *core.Identifier {
+	if len(data) == 0 {
+		return nil
+	}
+	tmpl := &core.TaskTemplate{}
+	if err := proto.Unmarshal(data, tmpl); err != nil {
+		return nil
+	}
+	if tmpl.GetId() == nil {
+		return nil
+	}
+	return proto.Clone(tmpl.GetId()).(*core.Identifier)
+}
+
+// buildOverridesFromTaskTemplate deserializes the task template and extracts resource requirements.
+func buildOverridesFromTaskTemplate(data []byte) *taskOverrides {
+	if len(data) == 0 {
+		return &taskOverrides{}
+	}
+	tmpl := &core.TaskTemplate{}
+	if err := proto.Unmarshal(data, tmpl); err != nil {
+		return &taskOverrides{}
+	}
+	container := tmpl.GetContainer()
+	if container == nil {
+		return &taskOverrides{}
+	}
+	res, err := flytek8s.ToK8sResourceRequirements(container.Resources)
+	if err != nil {
+		return &taskOverrides{}
+	}
+	return &taskOverrides{resources: res}
+}
+
+// extractSecurityContextFromTaskTemplate deserializes the task template and extracts SecurityContext.
+func extractSecurityContextFromTaskTemplate(data []byte) *core.SecurityContext {
+	if len(data) == 0 {
+		return &core.SecurityContext{}
+	}
+	tmpl := &core.TaskTemplate{}
+	if err := proto.Unmarshal(data, tmpl); err != nil {
+		return &core.SecurityContext{}
+	}
+	if tmpl.SecurityContext == nil {
+		return &core.SecurityContext{}
+	}
+	return tmpl.GetSecurityContext()
+}
+
+func (m *taskExecutionMetadata) GetOwnerID() types.NamespacedName { return m.ownerID }
+func (m *taskExecutionMetadata) GetTaskExecutionID() pluginsCore.TaskExecutionID {
+	return m.taskExecutionID
+}
+func (m *taskExecutionMetadata) GetNamespace() string                       { return m.namespace }
+func (m *taskExecutionMetadata) GetOwnerReference() metav1.OwnerReference   { return m.ownerReference }
+func (m *taskExecutionMetadata) GetLabels() map[string]string               { return m.labels }
+func (m *taskExecutionMetadata) GetAnnotations() map[string]string          { return m.annotations }
+func (m *taskExecutionMetadata) GetMaxAttempts() uint32                     { return m.maxAttempts }
+func (m *taskExecutionMetadata) GetK8sServiceAccount() string               { return m.serviceAccount }
+func (m *taskExecutionMetadata) IsInterruptible() bool                      { return m.interruptible }
+func (m *taskExecutionMetadata) GetInterruptibleFailureThreshold() int32    { return 0 }
+func (m *taskExecutionMetadata) GetEnvironmentVariables() map[string]string { return m.envVars }
+func (m *taskExecutionMetadata) GetConsoleURL() string                      { return "" }
+
+func (m *taskExecutionMetadata) GetOverrides() pluginsCore.TaskOverrides {
+	return m.overrides
+}
+
+func (m *taskExecutionMetadata) GetSecurityContext() *core.SecurityContext {
+	return m.securityContext
+}
+
+func (m *taskExecutionMetadata) GetPlatformResources() *v1.ResourceRequirements {
+	return &v1.ResourceRequirements{}
+}
+
+func (m *taskExecutionMetadata) GetExternalResourceAttributes() pluginsCore.ExternalResourceAttributes {
+	return pluginsCore.ExternalResourceAttributes{}
+}
+
+// taskOverrides provides resource overrides extracted from the task template.
+type taskOverrides struct {
+	resources *v1.ResourceRequirements
+}
+
+func (t *taskOverrides) GetResources() *v1.ResourceRequirements        { return t.resources }
+func (t *taskOverrides) GetExtendedResources() *core.ExtendedResources { return nil }
+func (t *taskOverrides) GetContainerImage() string                     { return "" }
+func (t *taskOverrides) GetConfigMap() *v1.ConfigMap                   { return nil }
+func (t *taskOverrides) GetPodTemplate() *core.K8SPod                  { return nil }
+func (t *taskOverrides) GetConfig() map[string]string                  { return nil }

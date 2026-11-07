@@ -1,0 +1,275 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"go.opentelemetry.io/otel/attribute"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	flyteorgv1 "github.com/flyteorg/flyte/v2/executor/api/v1"
+)
+
+func createTaskAction(ctx context.Context, name string, labels map[string]string) *flyteorgv1.TaskAction {
+	ta := &flyteorgv1.TaskAction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			Labels:    labels,
+		},
+		Spec: flyteorgv1.TaskActionSpec{
+			RunName:       "test-run",
+			Project:       "test-project",
+			Domain:        "test-domain",
+			ActionName:    "test-action",
+			InputURI:      "/tmp/input",
+			RunOutputBase: "/tmp/output",
+			TaskType:      "python",
+			TaskTemplate:  buildTaskTemplateBytes("python", "python:3.11"),
+		},
+	}
+	ExpectWithOffset(1, k8sClient.Create(ctx, ta)).To(Succeed())
+	return ta
+}
+
+func deleteTaskAction(ctx context.Context, name string) {
+	ta := &flyteorgv1.TaskAction{}
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, ta)
+	if err == nil {
+		_ = k8sClient.Delete(ctx, ta)
+	}
+}
+
+var _ = Describe("GarbageCollector", func() {
+	ctx := context.Background()
+
+	AfterEach(func() {
+		// Clean up all TaskActions in default namespace
+		var list flyteorgv1.TaskActionList
+		Expect(k8sClient.List(ctx, &list, client.InNamespace("default"))).To(Succeed())
+		for i := range list.Items {
+			_ = k8sClient.Delete(ctx, &list.Items[i])
+		}
+	})
+
+	It("should delete TaskActions with expired completed-time label", func() {
+		expiredTime := time.Now().UTC().Add(-2 * time.Hour).Format(labelTimeFormat)
+		createTaskAction(ctx, "gc-expired", map[string]string{
+			LabelTerminationStatus: LabelValueTerminated,
+			LabelCompletedTime:     expiredTime,
+		})
+
+		gc := NewGarbageCollector(k8sClient, k8sClient, 1*time.Minute, 1*time.Hour, metricnoop.NewMeterProvider())
+		Expect(gc.collect(ctx)).To(Succeed())
+
+		ta := &flyteorgv1.TaskAction{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: "gc-expired", Namespace: "default"}, ta)
+		Expect(err).To(HaveOccurred())
+		Expect(client.IgnoreNotFound(err)).To(Succeed())
+	})
+
+	It("should retain TaskActions with recent completed-time label", func() {
+		recentTime := time.Now().UTC().Format(labelTimeFormat)
+		createTaskAction(ctx, "gc-recent", map[string]string{
+			LabelTerminationStatus: LabelValueTerminated,
+			LabelCompletedTime:     recentTime,
+		})
+
+		gc := NewGarbageCollector(k8sClient, k8sClient, 1*time.Minute, 1*time.Hour, metricnoop.NewMeterProvider())
+		Expect(gc.collect(ctx)).To(Succeed())
+
+		ta := &flyteorgv1.TaskAction{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: "gc-recent", Namespace: "default"}, ta)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("should delete terminal TaskActions immediately when maxTTL is zero", func() {
+		recentTime := time.Now().UTC().Format(labelTimeFormat)
+		createTaskAction(ctx, "gc-immediate", map[string]string{
+			LabelTerminationStatus: LabelValueTerminated,
+			LabelCompletedTime:     recentTime,
+		})
+
+		gc := NewGarbageCollector(k8sClient, k8sClient, 1*time.Minute, 0, metricnoop.NewMeterProvider())
+		Expect(gc.collect(ctx)).To(Succeed())
+
+		ta := &flyteorgv1.TaskAction{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: "gc-immediate", Namespace: "default"}, ta)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+
+	It("should retain non-terminated TaskActions", func() {
+		createTaskAction(ctx, "gc-active", nil)
+
+		gc := NewGarbageCollector(k8sClient, k8sClient, 1*time.Minute, 1*time.Hour, metricnoop.NewMeterProvider())
+		Expect(gc.collect(ctx)).To(Succeed())
+
+		ta := &flyteorgv1.TaskAction{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: "gc-active", Namespace: "default"}, ta)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("should handle empty list gracefully", func() {
+		gc := NewGarbageCollector(k8sClient, k8sClient, 1*time.Minute, 1*time.Hour, metricnoop.NewMeterProvider())
+		Expect(gc.collect(ctx)).To(Succeed())
+	})
+
+	It("should paginate across multiple pages of expired TaskActions", func() {
+		// collect() lists with Continue pagination; this exercises that path
+		// (regression: it ran against the cache client, which rejects Continue
+		// with "continue list option is not supported by the cache" once a run
+		// has more than one page of terminal actions). Reader must be uncached.
+		orig := gcPageSize
+		gcPageSize = 2
+		defer func() { gcPageSize = orig }()
+
+		expiredTime := time.Now().UTC().Add(-2 * time.Hour).Format(labelTimeFormat)
+		for i := 0; i < 5; i++ {
+			createTaskAction(ctx, fmt.Sprintf("gc-page-%d", i), map[string]string{
+				LabelTerminationStatus: LabelValueTerminated,
+				LabelCompletedTime:     expiredTime,
+			})
+		}
+
+		gc := NewGarbageCollector(k8sClient, k8sClient, 1*time.Minute, 1*time.Hour, metricnoop.NewMeterProvider())
+		Expect(gc.collect(ctx)).To(Succeed())
+
+		// Assert only the actions this spec created are gone -- checking the whole
+		// namespace is flaky because other specs can leave TaskActions lingering
+		// with a finalizer (DeletionTimestamp set but not yet removed).
+		for i := 0; i < 5; i++ {
+			ta := &flyteorgv1.TaskAction{}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: fmt.Sprintf("gc-page-%d", i), Namespace: "default"}, ta)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "gc-page-%d should be deleted across pages", i)
+		}
+	})
+
+	It("should sweep immediately on Start without waiting a full interval", func() {
+		expiredTime := time.Now().UTC().Add(-2 * time.Hour).Format(labelTimeFormat)
+		createTaskAction(ctx, "gc-startup", map[string]string{
+			LabelTerminationStatus: LabelValueTerminated,
+			LabelCompletedTime:     expiredTime,
+		})
+
+		// A long interval means the ticker will not fire during the test, so the
+		// expired TaskAction can only be deleted by the immediate startup sweep.
+		// Before the fix, Start waited a full interval before its first collect.
+		gc := NewGarbageCollector(k8sClient, k8sClient, 30*time.Minute, 1*time.Hour, metricnoop.NewMeterProvider())
+		startCtx, cancel := context.WithCancel(ctx)
+		doneCh := make(chan struct{})
+		go func() {
+			defer close(doneCh)
+			_ = gc.Start(startCtx)
+		}()
+		defer func() {
+			cancel()
+			Eventually(doneCh, 2*time.Second, 50*time.Millisecond).Should(BeClosed())
+		}()
+		Eventually(func() bool {
+			ta := &flyteorgv1.TaskAction{}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: "gc-startup", Namespace: "default"}, ta)
+			return apierrors.IsNotFound(err)
+		}, 10*time.Second, 200*time.Millisecond).Should(BeTrue(), "Start should delete the expired TaskAction via its initial sweep")
+	})
+
+	It("should record deletion and sweep metrics", func() {
+		expiredTime := time.Now().UTC().Add(-2 * time.Hour).Format(labelTimeFormat)
+		createTaskAction(ctx, "gc-metrics", map[string]string{
+			LabelTerminationStatus: LabelValueTerminated,
+			LabelCompletedTime:     expiredTime,
+		})
+
+		// Unlike the other specs, this one uses a real meter provider so the
+		// recording calls inside collect() are observable.
+		reader := sdkmetric.NewManualReader()
+		provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+		gc := NewGarbageCollector(k8sClient, k8sClient, 1*time.Minute, 1*time.Hour, provider)
+
+		Expect(gc.collect(ctx)).To(Succeed())
+
+		var rm metricdata.ResourceMetrics
+		Expect(reader.Collect(ctx, &rm)).To(Succeed())
+
+		data := map[string]metricdata.Aggregation{}
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				data[m.Name] = m.Data
+			}
+		}
+
+		sum, ok := data["taskaction.gc.deletions"].(metricdata.Sum[int64])
+		Expect(ok).To(BeTrue())
+		var deleted int64
+		for _, dp := range sum.DataPoints {
+			v, found := dp.Attributes.Value(attribute.Key("outcome"))
+			Expect(found).To(BeTrue())
+			if v.AsString() == gcOutcomeDeleted {
+				deleted += dp.Value
+			}
+		}
+		// At least one: the AfterEach cleanup is asynchronous, so a TaskAction
+		// from a previous spec can still be present and get swept here too.
+		Expect(deleted).To(BeNumerically(">=", 1))
+
+		hist, ok := data["taskaction.gc.sweep.duration"].(metricdata.Histogram[float64])
+		Expect(ok).To(BeTrue())
+		Expect(hist.DataPoints).To(HaveLen(1))
+		Expect(hist.DataPoints[0].Count).To(Equal(uint64(1)))
+	})
+})
+
+var _ = Describe("ensureTerminalLabels", func() {
+	ctx := context.Background()
+
+	AfterEach(func() {
+		deleteTaskAction(ctx, "terminal-labels-test")
+	})
+
+	It("should patch completed-time when termination-status is set but completed-time is missing", func() {
+		ta := createTaskAction(ctx, "terminal-missing-time", map[string]string{
+			LabelTerminationStatus: LabelValueTerminated,
+		})
+		defer deleteTaskAction(ctx, "terminal-missing-time")
+
+		reconciler := &TaskActionReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		Expect(reconciler.ensureTerminalLabels(ctx, ta)).To(Succeed())
+		Expect(ta.GetLabels()[LabelTerminationStatus]).To(Equal(LabelValueTerminated))
+		Expect(ta.GetLabels()[LabelCompletedTime]).NotTo(BeEmpty())
+	})
+
+	It("should be idempotent", func() {
+		ta := createTaskAction(ctx, "terminal-labels-test", nil)
+
+		reconciler := &TaskActionReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		// First call should set labels
+		Expect(reconciler.ensureTerminalLabels(ctx, ta)).To(Succeed())
+		Expect(ta.GetLabels()[LabelTerminationStatus]).To(Equal(LabelValueTerminated))
+		Expect(ta.GetLabels()[LabelCompletedTime]).NotTo(BeEmpty())
+		firstCompletedTime := ta.GetLabels()[LabelCompletedTime]
+
+		// Re-fetch to get updated resource version
+		updated := &flyteorgv1.TaskAction{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "terminal-labels-test", Namespace: "default"}, updated)).To(Succeed())
+
+		// Second call should be a no-op (labels already set)
+		Expect(reconciler.ensureTerminalLabels(ctx, updated)).To(Succeed())
+		Expect(updated.GetLabels()[LabelCompletedTime]).To(Equal(firstCompletedTime))
+	})
+})

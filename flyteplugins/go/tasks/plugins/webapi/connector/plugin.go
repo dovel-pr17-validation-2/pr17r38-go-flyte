@@ -1,0 +1,505 @@
+package connector
+
+import (
+	"context"
+	"encoding/gob"
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
+	"k8s.io/apimachinery/pkg/util/wait"
+
+	pluginErrors "github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/errors"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/logs"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/core"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/core/template"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/io"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/ioutils"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/secret"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/tasklog"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/utils"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/webapi"
+	"github.com/flyteorg/flyte/v2/flytestdlib/logger"
+	connectorPb "github.com/flyteorg/flyte/v2/gen/go/flyteidl2/connector"
+	flyteIdl "github.com/flyteorg/flyte/v2/gen/go/flyteidl2/core"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/task"
+)
+
+const ID = "connector-service"
+
+type ConnectorService struct {
+	mu                 sync.RWMutex
+	supportedTaskTypes []string
+	CorePlugin         core.Plugin
+}
+
+// ContainTaskType check if connector supports this task type.
+func (p *ConnectorService) ContainTaskType(taskType string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return slices.Contains(p.supportedTaskTypes, taskType)
+}
+
+// SetSupportedTaskType set supportTaskType in the connector service.
+func (p *ConnectorService) SetSupportedTaskType(ctx context.Context, taskTypes []string) {
+	normalized := slices.Compact(slices.Sorted(slices.Values(taskTypes)))
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Log the supported task types only when the set changes, to avoid
+	// re-logging the identical registry on every poll interval.
+	if !slices.Equal(normalized, p.supportedTaskTypes) {
+		logger.Infof(ctx, "ConnectorDeployments support the following task types: [%v]", strings.Join(normalized, ", "))
+	}
+	p.supportedTaskTypes = normalized
+}
+
+type RegistryKey struct {
+	project         string
+	domain          string
+	taskTypeName    string
+	taskTypeVersion int32
+}
+
+type Registry map[RegistryKey]*Connector
+
+// getSupportedTaskTypes Get all the supported task types in the registry.
+func (r Registry) getSupportedTaskTypes() []string {
+	var taskTypes []string
+	for k := range r {
+		taskTypes = append(taskTypes, k.taskTypeName)
+	}
+	return taskTypes
+}
+
+type Plugin struct {
+	getTaskPhase *prometheus.CounterVec
+	cfg          *Config
+	cs           *ClientSet
+	registry     Registry
+	mu           sync.RWMutex
+}
+
+type ResourceWrapper struct {
+	Phase             flyteIdl.TaskExecution_Phase
+	Outputs           *task.Outputs
+	Message           string
+	LogLinks          []*flyteIdl.TaskLog
+	CustomInfo        *structpb.Struct
+	ConnectorID       string
+	IsConnectorApp    bool
+	ConnectorEndpoint string
+}
+
+// IsTerminal is used to avoid making network calls to the connector service if the resource is already in a terminal state.
+func (r ResourceWrapper) IsTerminal() bool {
+	return r.Phase == flyteIdl.TaskExecution_SUCCEEDED || r.Phase == flyteIdl.TaskExecution_FAILED || r.Phase == flyteIdl.TaskExecution_RETRYABLE_FAILED || r.Phase == flyteIdl.TaskExecution_ABORTED
+}
+
+type ResourceMetaWrapper struct {
+	OutputPrefix          string
+	ConnectorResourceMeta []byte
+	TaskCategory          *connectorPb.TaskCategory
+	Project               string
+	Domain                string
+	Connection            *flyteIdl.Connection
+}
+
+func (p *Plugin) setRegistry(r Registry) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.registry = r
+}
+
+func (p *Plugin) GetConfig() webapi.PluginConfig {
+	return GetConfig().WebAPI
+}
+
+func (p *Plugin) ResourceRequirements(_ context.Context, _ webapi.TaskExecutionContextReader) (
+	namespace core.ResourceNamespace, constraints core.ResourceConstraintsSpec, err error) {
+
+	// Resource requirements are assumed to be the same.
+	return "default", p.cfg.ResourceConstraints, nil
+}
+
+func (p *Plugin) Create(ctx context.Context, taskCtx webapi.TaskExecutionContextReader) (webapi.ResourceMeta,
+	webapi.Resource, error) {
+	taskTemplate, err := taskCtx.TaskReader().Read(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read task template with error: %v", err)
+	}
+	literalMap, err := taskCtx.InputReader().Get(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read inputs with error: %v", err)
+	}
+
+	var argTemplate []string
+	if taskTemplate.GetContainer() != nil {
+		templateParameters := template.Parameters{
+			TaskExecMetadata: taskCtx.TaskExecutionMetadata(),
+			Inputs:           taskCtx.InputReader(),
+			OutputPath:       taskCtx.OutputWriter(),
+			Task:             taskCtx.TaskReader(),
+		}
+		argTemplate = taskTemplate.GetContainer().GetArgs()
+		modifiedArgs, err := template.Render(ctx, taskTemplate.GetContainer().GetArgs(), templateParameters)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to render args with error: %v", err)
+		}
+		taskTemplate.GetContainer().Args = modifiedArgs
+		defer func() {
+			// Restore unrendered template for subsequent renders.
+			taskTemplate.GetContainer().Args = argTemplate
+		}()
+	}
+	outputPrefix := taskCtx.OutputWriter().GetOutputPrefixPath().String()
+
+	taskCategory := connectorPb.TaskCategory{Name: taskTemplate.GetType(), Version: taskTemplate.GetTaskTypeVersion()}
+	project := taskTemplate.GetId().GetProject()
+	domain := taskTemplate.GetId().GetDomain()
+	connector, err := p.getFinalConnector(&taskCategory, p.cfg, project, domain)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	connection := flyteIdl.Connection{}
+	err = utils.UnmarshalStruct(taskTemplate.GetCustom(), &connection) //nolint: staticcheck
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to unmarshal connection from task template custom: %v", err)
+	}
+	labels := taskCtx.TaskExecutionMetadata().GetLabels()
+	for k, v := range connection.GetSecrets() {
+		secretID, err := secret.GetSecretID(v, labels)
+		if err != nil {
+			errString := fmt.Sprintf("Failed to get secret id with error: %v", err)
+			logger.Errorf(ctx, errString)
+			return nil, nil, status.Error(codes.Internal, errString)
+		}
+		secretVal, err := taskCtx.SecretManager().Get(ctx, secretID)
+		if err != nil {
+			errString := fmt.Sprintf("Failed to get secret value with error: %v", err)
+			logger.Errorf(ctx, errString)
+			return nil, nil, status.Error(codes.Internal, errString)
+		}
+		connection.Secrets[k] = secretVal
+	}
+
+	taskExecutionMetadata := buildTaskExecutionMetadata(taskCtx.TaskExecutionMetadata())
+
+	finalCtx, cancel := getFinalContext(ctx, "CreateTask", connector.ConnectorDeployment)
+	defer cancel()
+
+	// Use async connector client
+	client, err := p.getAsyncConnectorClient(ctx, connector.ConnectorDeployment)
+	if err != nil {
+		return nil, nil, err
+	}
+	var inputs *task.Inputs
+	if literalMap != nil {
+		var literals []*task.NamedLiteral
+		for name, val := range literalMap.Literals {
+			literals = append(literals, &task.NamedLiteral{Name: name, Value: val})
+		}
+		inputs = &task.Inputs{Literals: literals}
+	}
+
+	request := &connectorPb.CreateTaskRequest{
+		Inputs:                inputs,
+		Template:              taskTemplate,
+		OutputPrefix:          outputPrefix,
+		TaskExecutionMetadata: &taskExecutionMetadata,
+		Connection:            &connection,
+	}
+	res, err := client.CreateTask(finalCtx, request)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create task from connector with %v", err)
+	}
+
+	return ResourceMetaWrapper{
+		OutputPrefix:          outputPrefix,
+		ConnectorResourceMeta: res.GetResourceMeta(),
+		TaskCategory:          &taskCategory,
+		Connection:            &connection,
+		Project:               project,
+		Domain:                domain,
+	}, nil, nil
+}
+
+func (p *Plugin) Get(ctx context.Context, taskCtx webapi.GetContext) (latest webapi.Resource, err error) {
+	metadata := taskCtx.ResourceMeta().(ResourceMetaWrapper)
+	connector, err := p.getFinalConnector(metadata.TaskCategory, p.cfg, metadata.Project, metadata.Domain)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := p.getAsyncConnectorClient(ctx, connector.ConnectorDeployment)
+	if err != nil {
+		return nil, err
+	}
+	finalCtx, cancel := getFinalContext(ctx, "GetTask", connector.ConnectorDeployment)
+	defer cancel()
+
+	request := &connectorPb.GetTaskRequest{
+		TaskCategory: metadata.TaskCategory,
+		ResourceMeta: metadata.ConnectorResourceMeta,
+		OutputPrefix: metadata.OutputPrefix,
+		Connection:   metadata.Connection,
+	}
+	res, err := client.GetTask(finalCtx, request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get task from connector with %v", err)
+	}
+	// Track the status the connector reports back (RUNNING/SUCCEEDED/FAILED/...) per GetTask.
+	if p.getTaskPhase != nil {
+		p.getTaskPhase.WithLabelValues(res.GetResource().GetPhase().String()).Inc()
+	}
+	return ResourceWrapper{
+		Phase:             res.GetResource().GetPhase(),
+		Outputs:           res.GetResource().GetOutputs(),
+		Message:           res.GetResource().GetMessage(),
+		LogLinks:          res.GetResource().GetLogLinks(),
+		CustomInfo:        res.GetResource().GetCustomInfo(),
+		ConnectorID:       connector.ConnectorID,
+		IsConnectorApp:    connector.IsConnectorApp,
+		ConnectorEndpoint: connector.ConnectorDeployment.Endpoint,
+	}, nil
+}
+
+func (p *Plugin) Delete(ctx context.Context, taskCtx webapi.DeleteContext) error {
+	if taskCtx.ResourceMeta() == nil {
+		return nil
+	}
+	metadata := taskCtx.ResourceMeta().(ResourceMetaWrapper)
+	connector, err := p.getFinalConnector(metadata.TaskCategory, p.cfg, metadata.Project, metadata.Domain)
+	if err != nil {
+		return err
+	}
+
+	client, err := p.getAsyncConnectorClient(ctx, connector.ConnectorDeployment)
+	if err != nil {
+		return err
+	}
+	finalCtx, cancel := getFinalContext(ctx, "DeleteTask", connector.ConnectorDeployment)
+	defer cancel()
+
+	request := &connectorPb.DeleteTaskRequest{
+		TaskCategory: metadata.TaskCategory,
+		ResourceMeta: metadata.ConnectorResourceMeta,
+		Connection:   metadata.Connection,
+	}
+	_, err = client.DeleteTask(finalCtx, request)
+	if err != nil {
+		return fmt.Errorf("failed to delete task from connector with %v", err)
+	}
+	return nil
+}
+
+func (p *Plugin) getEventInfoForConnectorApp(taskCtx webapi.StatusContext, resource ResourceWrapper) ([]*flyteIdl.TaskLog, error) {
+	logPlugin, err := logs.InitializeLogPlugins(&p.cfg.Logs, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize log plugins with error: %v", err)
+	}
+	taskLogs := resource.LogLinks
+
+	if taskCtx.TaskExecutionMetadata().GetTaskExecutionID() == nil || !resource.IsConnectorApp {
+		return taskLogs, nil
+	}
+
+	in := tasklog.Input{
+		TaskExecutionID: taskCtx.TaskExecutionMetadata().GetTaskExecutionID(),
+		ConnectorID:     resource.ConnectorID,
+	}
+
+	logs, err := logPlugin.GetTaskLogs(in)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get task logs with error: %v", err)
+	}
+
+	taskLogs = append(taskLogs, logs.TaskLogs...)
+
+	return taskLogs, nil
+}
+
+func (p *Plugin) Status(ctx context.Context, taskCtx webapi.StatusContext) (phase core.PhaseInfo, err error) {
+	resource := taskCtx.Resource().(ResourceWrapper)
+
+	logLinks, err := p.getEventInfoForConnectorApp(taskCtx, resource)
+	if err != nil {
+		return core.PhaseInfoUndefined, err
+	}
+
+	taskInfo := &core.TaskInfo{Logs: logLinks, CustomInfo: resource.CustomInfo}
+
+	if resource.ConnectorEndpoint != "" {
+		taskInfo.LogContext = &flyteIdl.LogContext{
+			Connector: &flyteIdl.ConnectorLogContext{
+				Endpoint: resource.ConnectorEndpoint,
+			},
+		}
+	}
+
+	errorCode := pluginErrors.TaskFailedWithError
+
+	switch resource.Phase {
+	case flyteIdl.TaskExecution_QUEUED:
+		return core.PhaseInfoQueuedWithTaskInfo(time.Now(), core.DefaultPhaseVersion, resource.Message, taskInfo), nil
+	case flyteIdl.TaskExecution_WAITING_FOR_RESOURCES:
+		return core.PhaseInfoWaitingForResourcesInfo(time.Now(), core.DefaultPhaseVersion, resource.Message, taskInfo), nil
+	case flyteIdl.TaskExecution_INITIALIZING:
+		return core.PhaseInfoInitializing(time.Now(), core.DefaultPhaseVersion, resource.Message, taskInfo), nil
+	case flyteIdl.TaskExecution_RUNNING:
+		return core.PhaseInfoRunning(core.DefaultPhaseVersion, taskInfo), nil
+	case flyteIdl.TaskExecution_SUCCEEDED:
+		var literalMap *flyteIdl.LiteralMap
+		if resource.Outputs != nil {
+			literalMap = &flyteIdl.LiteralMap{Literals: make(map[string]*flyteIdl.Literal)}
+			for _, val := range resource.Outputs.Literals {
+				literalMap.Literals[val.Name] = val.Value
+			}
+		}
+		err = writeOutput(ctx, taskCtx, literalMap)
+		if err != nil {
+			logger.Errorf(ctx, "failed to write output with err %s", err.Error())
+			return core.PhaseInfoUndefined, err
+		}
+		return core.PhaseInfoSuccess(taskInfo), nil
+	case flyteIdl.TaskExecution_ABORTED:
+		return core.PhaseInfoFailure(errorCode, "failed to run the job with aborted phase.", taskInfo), nil
+	case flyteIdl.TaskExecution_FAILED:
+		return core.PhaseInfoFailure(errorCode, fmt.Sprintf("failed to run the job: %s", resource.Message), taskInfo), nil
+	case flyteIdl.TaskExecution_RETRYABLE_FAILED:
+		return core.PhaseInfoRetryableFailure(errorCode, fmt.Sprintf("failed to run the job: %s", resource.Message), taskInfo), nil
+	}
+	// The default phase is undefined.
+	return core.PhaseInfoUndefined, pluginErrors.Errorf(core.SystemErrorCode, "unknown execution phase [%v].", resource.Phase)
+}
+
+func (p *Plugin) getAsyncConnectorClient(ctx context.Context, connector *Deployment) (connectorPb.AsyncConnectorServiceClient, error) {
+	return p.cs.getOrDialAsyncClient(ctx, connector)
+}
+
+func (p *Plugin) watchConnectors(ctx context.Context, connectorService *ConnectorService) {
+	go wait.Until(func() {
+		for _, deployment := range allConnectorDeployments(GetConfig()) {
+			if _, err := p.cs.getOrDialMetadataClient(ctx, deployment); err != nil {
+				logger.Errorf(ctx, "failed to connect to connector [%v]: %v", deployment.Endpoint, err)
+			}
+		}
+		connectorRegistry := getConnectorRegistry(ctx, p.cs)
+		p.setRegistry(connectorRegistry)
+		connectorService.SetSupportedTaskType(ctx, connectorRegistry.getSupportedTaskTypes())
+	}, p.cfg.PollInterval.Duration, ctx.Done())
+}
+
+func (p *Plugin) getFinalConnector(taskCategory *connectorPb.TaskCategory, cfg *Config, project, domain string) (*Connector, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	taskTypeName := taskCategory.GetName()
+	taskTypeVersion := taskCategory.GetVersion()
+
+	registryKey := RegistryKey{project: project, domain: domain, taskTypeName: taskTypeName, taskTypeVersion: taskTypeVersion}
+	if connector, exists := p.registry[registryKey]; exists {
+		return connector, nil
+	}
+	logger.Debugf(context.Background(), "No connector found for task type [%s] and version [%d] in project [%s] domain [%s].", taskTypeName, taskTypeVersion, project, domain)
+
+	// Fall back to a connector registered for the domain across all projects.
+	registryKey = RegistryKey{project: "", domain: domain, taskTypeName: taskTypeName, taskTypeVersion: taskTypeVersion}
+	if connector, exists := p.registry[registryKey]; exists {
+		return connector, nil
+	}
+	logger.Debugf(context.Background(), "No connector found for task type [%s] and version [%d] in domain [%s].", taskTypeName, taskTypeVersion, domain)
+
+	// Fall back to a connector that supports across all projects and domains.
+	registryKey = RegistryKey{project: "", domain: "", taskTypeName: taskTypeName, taskTypeVersion: taskTypeVersion}
+	if connector, exists := p.registry[registryKey]; exists {
+		return connector, nil
+	}
+	logger.Debugf(context.Background(), "No connector found for task type [%s] and version [%d] in any project or domain.", taskTypeName, taskTypeVersion)
+
+	if len(cfg.DefaultConnector.Endpoint) != 0 {
+		return &Connector{
+			ConnectorDeployment: &cfg.DefaultConnector,
+			ConnectorID:         "defaultConnector",
+			IsConnectorApp:      false,
+		}, nil
+	}
+
+	logger.Errorf(context.Background(), "No connector found for task type [%s] and version [%d]. Using default connector.", taskCategory.GetName(), taskCategory.GetVersion())
+	return nil, fmt.Errorf("no connector found for task type [%s] and version [%d]", taskCategory.GetName(), taskCategory.GetVersion())
+}
+
+func writeOutput(ctx context.Context, taskCtx webapi.StatusContext, outputs *flyteIdl.LiteralMap) error {
+	taskTemplate, err := taskCtx.TaskReader().Read(ctx)
+	if err != nil {
+		return err
+	}
+
+	if taskTemplate.GetInterface() == nil || taskTemplate.GetInterface().GetOutputs() == nil || taskTemplate.Interface.Outputs.Variables == nil {
+		logger.Debugf(ctx, "The task declares no outputs. Skipping writing the outputs.")
+		return nil
+	}
+
+	var opReader io.OutputReader
+	if outputs != nil {
+		logger.Debugf(ctx, "ConnectorDeployment returned an output.")
+		opReader = ioutils.NewInMemoryOutputReader(outputs, nil, nil)
+	} else {
+		logger.Debugf(ctx, "ConnectorDeployment didn't return any output, assuming file based outputs.")
+		opReader = ioutils.NewRemoteFileOutputReader(ctx, taskCtx.DataStore(), taskCtx.OutputWriter(), 0)
+	}
+	return taskCtx.OutputWriter().Put(ctx, opReader)
+}
+
+func buildTaskExecutionMetadata(taskExecutionMetadata core.TaskExecutionMetadata) connectorPb.TaskExecutionMetadata {
+	taskExecutionID := taskExecutionMetadata.GetTaskExecutionID().GetID()
+
+	return connectorPb.TaskExecutionMetadata{
+		TaskExecutionId:      taskExecutionID,
+		Namespace:            taskExecutionMetadata.GetNamespace(),
+		Labels:               taskExecutionMetadata.GetLabels(),
+		Annotations:          taskExecutionMetadata.GetAnnotations(),
+		K8SServiceAccount:    taskExecutionMetadata.GetK8sServiceAccount(),
+		EnvironmentVariables: taskExecutionMetadata.GetEnvironmentVariables(),
+		Identity:             taskExecutionMetadata.GetSecurityContext().GetRunAs(),
+	}
+}
+
+func newConnectorPlugin(connectorService *ConnectorService) webapi.PluginEntry {
+	gob.Register(ResourceMetaWrapper{})
+	gob.Register(ResourceWrapper{})
+	cfg := GetConfig()
+
+	return webapi.PluginEntry{
+		ID:                 ID,
+		SupportedTaskTypes: cfg.SupportedTaskTypes,
+		PluginLoader: func(ctx context.Context, iCtx webapi.PluginSetupContext) (webapi.AsyncPlugin, error) {
+			clientSet := getConnectorClientSets(ctx)
+			connectorRegistry := getConnectorRegistry(ctx, clientSet)
+			connectorService.SetSupportedTaskType(ctx, connectorRegistry.getSupportedTaskTypes())
+			scope := iCtx.MetricsScope()
+			plugin := &Plugin{
+				getTaskPhase: scope.MustNewCounterVec("connector_get_task_phase",
+					"GetTask responses from connectors, by returned task phase", "phase"),
+				cfg:      cfg,
+				cs:       clientSet,
+				registry: connectorRegistry,
+			}
+			plugin.watchConnectors(ctx, connectorService)
+			return plugin, nil
+		},
+	}
+}
+
+func RegisterConnectorPlugin(connectorService *ConnectorService) {
+	gob.Register(ResourceMetaWrapper{})
+	gob.Register(ResourceWrapper{})
+	pluginmachinery.PluginRegistry().RegisterRemotePlugin(newConnectorPlugin(connectorService))
+}

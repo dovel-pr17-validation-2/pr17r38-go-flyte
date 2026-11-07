@@ -1,0 +1,288 @@
+package k8s
+
+import (
+	"context"
+	"time"
+
+	"k8s.io/apimachinery/pkg/labels"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	pluginsCore "github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/core"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/io"
+	"github.com/flyteorg/flyte/v2/flytestdlib/storage"
+)
+
+// PluginEntry is a structure that is used to indicate to the system a K8s plugin
+type PluginEntry struct {
+	// ID/Name of the plugin. This will be used to identify this plugin and has to be unique in the entire system
+	// All functions like enabling and disabling a plugin use this ID
+	ID pluginsCore.TaskType
+	// A list of all the task types for which this plugin is applicable.
+	RegisteredTaskTypes []pluginsCore.TaskType
+	// An instance of the kubernetes resource this plugin is responsible for, for example v1.Pod{}
+	ResourceToWatch client.Object
+	// An instance of the plugin
+	Plugin Plugin
+	// ClusterPlugin, when non-nil, indicates this entry is driven by a ClusterPluginManager instead
+	// of a PluginManager. Exactly one of Plugin or ClusterPlugin must be set. When ClusterPlugin is
+	// set, ResourceToWatch must be the job resource type and ClusterResourceToWatch must be the
+	// cluster resource type.
+	ClusterPlugin ClusterPlugin
+	// ClusterResourceToWatch is the cluster CRD type (e.g. &rayv1.RayCluster{}). Required when
+	// ClusterPlugin is set, ignored otherwise.
+	ClusterResourceToWatch client.Object
+	// Boolean that indicates if this plugin can be used as the default for unknown task types. There can only be
+	// one default in the system
+	IsDefault bool
+	// Returns a new KubeClient to be used instead of the internal controller-runtime client.
+	CustomKubeClient func(ctx context.Context) (pluginsCore.KubeClient, error)
+}
+
+// System level properties that this Plugin supports
+type PluginProperties struct {
+	// Disables the inclusion of OwnerReferences in kubernetes resources that this plugin is responsible for.
+	// Disabling is only useful if resources will be created in a remote cluster.
+	DisableInjectOwnerReferences bool
+	// Boolean that indicates if finalizer injection should be disabled for resources that this plugin is
+	// responsible for.
+	DisableInjectFinalizer bool
+	// Specifies the length of TaskExecutionID generated name. default: 50
+	GeneratedNameMaxLength *int
+	// DisableDeleteResourceOnFinalize disables deleting the created resource on finalize. That behavior is controllable
+	// on the base K8sPluginConfig level but can be disabled for individual plugins. Plugins should generally not
+	// override that behavior unless the resource that gets created for this plugin does not consume resources (cluster's
+	// cpu/memory... etc. or external resources) once the plugin's Plugin.GetTaskPhase() returns a terminal phase.
+	DisableDeleteResourceOnFinalize bool
+}
+
+// Special context passed in to plugins when checking task phase
+type PluginContext interface {
+	// Returns a TaskReader, to retrieve task details
+	TaskReader() pluginsCore.TaskReader
+
+	// Returns an input reader to retrieve input data
+	InputReader() io.InputReader
+
+	// Provides an output sync of type io.OutputWriter
+	OutputWriter() io.OutputWriter
+
+	// Returns a handle to the currently configured storage backend that can be used to communicate with the tasks or write metadata
+	DataStore() *storage.DataStore
+
+	// Returns a handle to the Task's execution metadata.
+	TaskExecutionMetadata() pluginsCore.TaskExecutionMetadata
+
+	// Returns a reader that retrieves previously stored plugin internal state. the state itself is immutable
+	PluginStateReader() pluginsCore.PluginStateReader
+
+	// K8sReader returns a read-only k8s client that can fetch pod(s) for given node execution
+	K8sReader() client.Reader
+}
+
+// PluginState defines the state of a k8s plugin. This information must be maintained between propeller evaluations to
+// determine if there have been any updates since the previously evaluation.
+type PluginState struct {
+	// Phase is the plugin phase.
+	Phase pluginsCore.Phase
+	// PhaseVersion is an number used to indicate reportable changes to state that have the same phase.
+	PhaseVersion uint32
+	// Reason is the message explaining the purpose for being in the reported state.
+	Reason string
+}
+
+// Defines a simplified interface to author plugins for k8s resources.
+type Plugin interface {
+	// Defines a func to create a query object (typically just object and type meta portions) that's used to query k8s
+	// resources.
+	BuildIdentityResource(ctx context.Context, taskCtx pluginsCore.TaskExecutionMetadata) (client.Object, error)
+
+	// Defines a func to create the full resource object that will be posted to k8s.
+	BuildResource(ctx context.Context, taskCtx pluginsCore.TaskExecutionContext) (client.Object, error)
+
+	// Analyses the k8s resource and reports the status as TaskPhase. This call is expected to be relatively fast,
+	// any operations that might take a long time (limits are configured system-wide) should be offloaded to the
+	// background.
+	GetTaskPhase(ctx context.Context, pluginContext PluginContext, resource client.Object) (pluginsCore.PhaseInfo, error)
+
+	// Properties desired by the plugin
+	GetProperties() PluginProperties
+
+	// GarbageCollectable enables an external garbage collector to clean up resources created by the plugin
+	GarbageCollectable
+}
+
+// ClusterPlugin is a simplified interface to author plugins that run a job on top of a shared,
+// long-lived cluster resource. The cluster is created once (keyed by GetClusterName) and reused by
+// every task whose spec hashes to the same name; the job is created only after the cluster is ready.
+//
+// Unlike Plugin, the cluster resource is intentionally NOT owned by the task execution: it has no
+// owner reference and no finalizer, so completing or aborting one task never deletes a cluster that
+// other tasks may still be using. Cleanup of idle clusters is the plugin's own job via
+// StartCleanup. The job resource, by contrast, is owned normally.
+type ClusterPlugin interface {
+	// GetClusterName returns a deterministic name for the cluster backing this task. Implementations
+	// typically hash the task's plugin-spec proto so that identical specs collapse onto the same
+	// cluster. Callers should sanitize the result into a DNS1123 subdomain before use.
+	GetClusterName(ctx context.Context, taskCtx pluginsCore.TaskExecutionContext) (string, error)
+
+	// BuildClusterResource builds the full cluster object (e.g. a RayCluster) that will be posted to
+	// k8s. Name and namespace are assigned by the framework from GetClusterName.
+	BuildClusterResource(ctx context.Context, taskCtx pluginsCore.TaskExecutionContext) (client.Object, error)
+
+	// BuildClusterIdentityResource builds a query object (type/object meta only) used to GET the
+	// cluster for readiness checks.
+	BuildClusterIdentityResource(ctx context.Context, taskMeta pluginsCore.TaskExecutionMetadata) (client.Object, error)
+
+	// IsClusterReady reports whether the cluster can accept jobs.
+	IsClusterReady(ctx context.Context, pluginContext PluginContext, cluster client.Object) (bool, error)
+
+	// BuildJobResource builds the full job object (e.g. a RayJob) bound to the ready cluster
+	// identified by clusterName. The job is created with the normal owner reference / finalizer.
+	BuildJobResource(ctx context.Context, taskCtx pluginsCore.TaskExecutionContext, clusterName string) (client.Object, error)
+
+	// BuildJobIdentityResource builds a query object (type/object meta only) used to GET the job.
+	BuildJobIdentityResource(ctx context.Context, taskMeta pluginsCore.TaskExecutionMetadata) (client.Object, error)
+
+	// GetJobPhase analyses the job resource and reports the status as a TaskPhase. This is analogous
+	// to Plugin.GetTaskPhase and is expected to be relatively fast.
+	GetJobPhase(ctx context.Context, pluginContext PluginContext, job client.Object) (pluginsCore.PhaseInfo, error)
+
+	// GetProperties returns properties desired by the plugin (mirrors Plugin.GetProperties).
+	GetProperties() PluginProperties
+
+	// StartCleanup is intended to be called once by the component driving ClusterPlugins, with the
+	// kube client the plugin's resources live on. Cluster resources outlive individual tasks, so the
+	// plugin owns their cleanup: implementations typically start a background loop that deletes idle
+	// clusters (and any resources retained with them) once they have been idle past their TTL. The
+	// loop must exit when ctx is done; implementations with nothing to clean up may make this a no-op.
+	StartCleanup(ctx context.Context, kubeClient pluginsCore.KubeClient)
+}
+
+// GarbageCollectable is an interface plugins implement to provide an external garbage collector information.
+type GarbageCollectable interface {
+	// IsTerminal returns true if the resource is in a terminal state
+	IsTerminal(ctx context.Context, resource client.Object) (bool, error)
+
+	// GetCompletionTime returns when the resource reached terminal state
+	GetCompletionTime(resource client.Object) (time.Time, error)
+
+	// Note: The external garbage collector uses PluginEntry.ResourceToWatch to determine
+	// which resource type to delete. If a plugin creates additional resources that require
+	// cleanup, this interface will need to be extended to return those resources.
+}
+
+// ChildPodDiscovery is an optional interface a Plugin whose tracked resource is not a Pod
+// can implement so the framework can find the Pods an operator expanded from that resource.
+//
+// The framework tracks one object per task. For a plugin that tracks a Pod that object is
+// also where the kubelet and the node's daemons record what happened, but for a plugin that
+// tracks a CRD the interesting records land on the worker Pods the operator derived from
+// the templates the plugin built, which the framework otherwise has no way to name. A
+// plugin that does not implement this is treated as having no child Pods, which is what the
+// framework assumed before the interface existed.
+type ChildPodDiscovery interface {
+	// ChildPods returns the label selector that selects the Pods belonging to this attempt
+	// of this resource. They live in the resource's own namespace, which the caller already
+	// holds, so only the selector is the plugin's to decide.
+	//
+	// A nil selector means the plugin cannot name its child Pods and the caller must then
+	// look at no Pods at all rather than widen the search. Implementations should combine
+	// flytek8s.AttemptPodSelector, which is exact to one attempt of one action whichever
+	// operator created the Pod, with a label their own operator applies.
+	ChildPods(
+		ctx context.Context,
+		taskCtx pluginsCore.TaskExecutionMetadata,
+		resource client.Object,
+	) (labels.Selector, error)
+}
+
+// An optional interface a Plugin can implement to override its default OnAbort finalizer (deletion of the underlying resource).
+type PluginAbortOverride interface {
+	OnAbort(ctx context.Context, tCtx pluginsCore.TaskExecutionContext, resource client.Object) (behavior AbortBehavior, err error)
+}
+
+// Defines the overridden OnAbort behavior. The resource (by default, the underlying resource, although this
+// can be overridden) can be either patched, updated, or deleted.
+type AbortBehavior struct {
+	// Optional override to the default k8s Resource being acted on.
+	Resource       client.Object
+	DeleteResource bool
+	Update         *UpdateResourceOperation
+	Patch          *PatchResourceOperation
+	// Determines whether to delete the Resource if the specified operations return an error
+	DeleteOnErr bool
+}
+
+// Defines a Patch operation on a Resource
+type PatchResourceOperation struct {
+	Patch   client.Patch
+	Options []client.PatchOption
+}
+
+// Defines an Update operation on a Resource
+type UpdateResourceOperation struct {
+	Options []client.UpdateOption
+}
+
+// AbortBehavior that patches the default resource
+func AbortBehaviorPatchDefaultResource(patchOperation PatchResourceOperation, deleteOnErr bool) AbortBehavior {
+	return AbortBehaviorPatch(patchOperation, deleteOnErr, nil)
+}
+
+// AbortBehavior that patches the specified resource
+func AbortBehaviorPatch(patchOperation PatchResourceOperation, deleteOnErr bool, resource client.Object) AbortBehavior {
+	return AbortBehavior{
+		Resource:    resource,
+		Patch:       &patchOperation,
+		DeleteOnErr: deleteOnErr,
+	}
+}
+
+// AbortBehavior that updates the default resource
+func AbortBehaviorUpdateDefaultResource(updateOperation UpdateResourceOperation, deleteOnErr bool) AbortBehavior {
+	return AbortBehaviorUpdate(updateOperation, deleteOnErr, nil)
+}
+
+// AbortBehavior that updates the specified resource
+func AbortBehaviorUpdate(updateOperation UpdateResourceOperation, deleteOnErr bool, resource client.Object) AbortBehavior {
+	return AbortBehavior{
+		Resource:    resource,
+		Update:      &updateOperation,
+		DeleteOnErr: deleteOnErr,
+	}
+}
+
+// AbortBehavior that deletes the default resource
+func AbortBehaviorDeleteDefaultResource() AbortBehavior {
+	return AbortBehaviorDelete(nil)
+}
+
+// AbortBehavior that deletes the specified resource
+func AbortBehaviorDelete(resource client.Object) AbortBehavior {
+	return AbortBehavior{
+		Resource:       resource,
+		DeleteResource: true,
+	}
+}
+
+// if we have the same Phase as the previous evaluation and updated the Reason but not the PhaseVersion we must
+// update the PhaseVersion so an event is sent to reflect the Reason update. this does not handle the Running
+// Phase because the legacy used `DefaultPhaseVersion + 1` which will only increment to 1.
+
+func MaybeUpdatePhaseVersion(phaseInfo *pluginsCore.PhaseInfo, pluginState *PluginState) {
+	if phaseInfo.Phase() == pluginState.Phase &&
+		phaseInfo.Version() <= pluginState.PhaseVersion && phaseInfo.Reason() != pluginState.Reason {
+
+		*phaseInfo = phaseInfo.WithVersion(pluginState.PhaseVersion + 1)
+	}
+}
+
+func MaybeUpdatePhaseVersionFromPluginContext(phaseInfo *pluginsCore.PhaseInfo, pluginContext *PluginContext) error {
+	pluginState := PluginState{}
+	_, err := (*pluginContext).PluginStateReader().Get(&pluginState)
+	if err != nil {
+		return err
+	}
+	MaybeUpdatePhaseVersion(phaseInfo, &pluginState)
+	return nil
+}

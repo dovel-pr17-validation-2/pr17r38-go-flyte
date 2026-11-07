@@ -1,0 +1,2053 @@
+package flytek8s
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/golang/protobuf/proto" //nolint: staticcheck
+	"github.com/imdario/mergo"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	pluginserrors "github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/errors"
+	pluginsCore "github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/core"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/core/template"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/flytek8s/config"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/k8s"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/utils"
+
+	"github.com/flyteorg/flyte/v2/flytestdlib/logger"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/core"
+)
+
+const PodKind = "pod"
+const OOMKilled = "OOMKilled"
+const Interrupted = "Interrupted"
+const PrimaryContainerNotFound = "PrimaryContainerNotFound"
+const SIGKILL = 137
+
+// unsignedSIGKILL = 256 - 9
+const unsignedSIGKILL = 247
+
+// ContainerFailed is reported when the task's container exited with a non-zero status of its own
+// accord and the container runtime gave no more specific reason.
+const ContainerFailed = "ContainerFailed"
+
+// maxUserExitCode is the highest exit status attributable to the application itself. A process
+// killed by signal N is reported as 128+N, so the band above 127 means something terminated the
+// process rather than the process choosing to fail. Graceful eviction, drain and preemption all
+// send SIGTERM first, which surfaces as 143.
+const maxUserExitCode = 127
+
+// terminationMessageReadFailure is what the kubelet records in a container's termination message
+// when it cannot reach the container's log to read it. The accompanying exit code is fabricated.
+const terminationMessageReadFailure = "Error on reading termination message from logs"
+
+// TerminationTargetCondition is the pod status condition an external controller sets, with the
+// reason and the message of its decision, right before it deletes a pod it manages. Kueue stamps
+// it on every pod it stops (the Workload was preempted, evicted or deactivated), and it is the only
+// place that reason survives: to the kubelet the deletion looks like any other.
+const TerminationTargetCondition v1.PodConditionType = "TerminationTarget"
+
+// disruptionTargetReasons are the reasons of the Kubernetes DisruptionTarget condition that mark a
+// pod the cluster removed: preempted by a scheduler (kube-scheduler, or KAI with
+// --update-pod-eviction-condition), evicted through the eviction API (a drain), deleted by the
+// taint manager or the pod garbage collector. TerminationByKubelet is left out: it also marks a
+// node-pressure eviction, which the task's own memory use can cause.
+var disruptionTargetReasons = sets.NewString(
+	v1.PodReasonPreemptionByScheduler,
+	// Set by Kubernetes components, but not exported by k8s.io/api.
+	"EvictionByEvictionAPI",
+	"DeletionByTaintManager",
+	"DeletionByPodGC",
+)
+
+// GetTerminationTarget returns the TerminationTarget condition when an external controller marked
+// the pod for termination, or the DisruptionTarget condition when the cluster removed it for one of
+// disruptionTargetReasons, nil otherwise. For TerminationTarget only the condition type is matched:
+// the reason Kueue writes there has changed across its releases (StoppedByKueue, WorkloadEvicted,
+// WorkloadEvictedDueToPreempted) and is reported as it is.
+//
+// A DisruptionTarget stamped after the primary container had already finished is ignored: the pod
+// died on its own (a drain reaching a pod that had already failed, or pod GC cleaning it up), and
+// its exit code, not the disruption, is the verdict.
+func GetTerminationTarget(status v1.PodStatus, primaryContainerName string) *v1.PodCondition {
+	for i := range status.Conditions {
+		c := &status.Conditions[i]
+		if c.Status != v1.ConditionTrue {
+			continue
+		}
+		if c.Type == TerminationTargetCondition ||
+			(c.Type == v1.DisruptionTarget && disruptionTargetReasons.Has(c.Reason) &&
+				!disruptedAfterFinish(status, c, primaryContainerName)) {
+			return c
+		}
+	}
+	return nil
+}
+
+// disruptedAfterFinish reports whether the condition was stamped strictly after the primary
+// container terminated. Both timestamps have one-second resolution, so a disruption within the
+// same second as the exit still counts as its cause.
+func disruptedAfterFinish(status v1.PodStatus, c *v1.PodCondition, primaryContainerName string) bool {
+	if c.LastTransitionTime.IsZero() {
+		return false
+	}
+	for _, s := range status.ContainerStatuses {
+		if s.Name != primaryContainerName {
+			continue
+		}
+		t := s.State.Terminated
+		return t != nil && !t.FinishedAt.IsZero() && c.LastTransitionTime.After(t.FinishedAt.Time)
+	}
+	return false
+}
+
+// ExternalTerminationCode is the error code for a pod an external controller terminated: the
+// controller's own reason, so that a Kueue preemption reads as such rather than as an interruption.
+func ExternalTerminationCode(c *v1.PodCondition) string {
+	if c.Reason != "" {
+		return c.Reason
+	}
+	return string(TerminationTargetCondition)
+}
+
+// ExternalTerminationMessage explains a pod's termination in the words of the controller that
+// decided it, for example why Kueue preempted the Workload.
+func ExternalTerminationMessage(c *v1.PodCondition) string {
+	message := "Pod was terminated by an external controller"
+	if c.Message != "" {
+		return message + ": " + c.Message
+	}
+	if c.Reason != "" {
+		return message + " (" + c.Reason + ")"
+	}
+	return message
+}
+
+const defaultContainerTemplateName = "default"
+const defaultInitContainerTemplateName = "default-init"
+const primaryContainerTemplateName = "primary"
+const primaryInitContainerTemplateName = "primary-init"
+const PrimaryContainerKey = "primary_container_name"
+const FlyteEnableVscode = "_F_E_VS"
+
+// GpuPartitionSlicesLabel is applied to pods that request a MIG GPU partition.
+// The value is the number of compute slices consumed (out of 7 total), parsed from
+// the "Xg.Ygb" partition size format. Downstream consumers (e.g. billing) use this
+// to compute fractional GPU usage as slices/7.
+const GpuPartitionSlicesLabel = "platform.union.ai/gpu-partition-slices"
+
+// ManagedLabelKey and ManagedLabelValue mark the Pods the executor is responsible for.
+// The executor's informer cache selects on this label so it does not have to hold every
+// Pod in the cluster, so anything the executor needs to observe must carry it. It lives
+// here rather than in the executor because the plugins that build Pod templates have to
+// keep it intact.
+const (
+	ManagedLabelKey   = "flyte.org/managed"
+	ManagedLabelValue = "true"
+)
+
+// Labels identifying which attempt of which action a Pod belongs to. They are stamped on
+// every task's execution metadata and every plugin merges that metadata into the Pod
+// templates it builds, so an operator that expands one of those templates carries them
+// onto the Pods it creates. They live here for the same reason ManagedLabelKey does: the
+// plugins that build Pod templates have to keep them intact, and the framework has to be
+// able to select on them afterwards.
+//
+// They are bare names, matching the project/domain/organization labels already injected,
+// which kube-state-metrics surfaces as label_run, label_action and label_attempt.
+const (
+	// RunLabel carries the name of the run that owns the action.
+	RunLabel = "run"
+	// ActionLabel carries the name of the action the pod is executing.
+	ActionLabel = "action"
+	// AttemptLabel carries the 1-based attempt number, so the pods of a retried action
+	// can be told apart from the pods of its earlier attempts.
+	AttemptLabel = "attempt"
+	// TaskNameLabel carries the registered task name from the task template.
+	TaskNameLabel = "task-name"
+)
+
+// attemptSelectionLabelKeys are the labels that together identify one attempt of one
+// action. They are what a Pod is looked up by, so all of them have to be present for a
+// selector to be exact.
+var attemptSelectionLabelKeys = []string{ManagedLabelKey, RunLabel, ActionLabel, AttemptLabel}
+
+// preservedLabelKeys are the labels a plugin must re-apply after any labels a user
+// supplied. It is the selection identity plus the task name.
+//
+// The two lists differ on purpose and neither is derived from the other. The task name
+// takes no part in finding a Pod, so adding it to the selector would only narrow a match
+// that is already exact. It is preserved anyway because the per-pod metrics that external
+// collectors scrape are joined on it, and a user label of the same name would silently
+// point those joins at the wrong task.
+var preservedLabelKeys = append(append([]string{}, attemptSelectionLabelKeys...), TaskNameLabel)
+
+// AttemptIdentityLabels returns the subset of the task's execution labels that identifies
+// this attempt of this action, or nil when any of them is missing.
+//
+// A plugin that lets a user supply their own labels for the Pod templates it builds has to
+// re-apply these last, the way it already re-applies the managed label: a user label named
+// run, action or attempt would otherwise overwrite the identity, and a Pod whose identity
+// has been overwritten is one AttemptPodSelector cannot find. The selector is built from
+// the same key set, so the two can never disagree about which labels have to survive.
+func AttemptIdentityLabels(taskCtx pluginsCore.TaskExecutionMetadata) map[string]string {
+	if taskCtx == nil {
+		return nil
+	}
+
+	podLabels := taskCtx.GetLabels()
+	identity := make(map[string]string, len(attemptSelectionLabelKeys))
+	for _, key := range attemptSelectionLabelKeys {
+		value, ok := podLabels[key]
+		if !ok || value == "" {
+			return nil
+		}
+		identity[key] = value
+	}
+
+	return identity
+}
+
+// PreservedPodLabels are the labels a plugin must apply last to every Pod template it
+// builds, after any labels the user supplied, so that nothing a user writes can take the
+// Pod out of the executor's reach or misattribute what it was doing. That is the managed
+// label the Pod cache selects on, the attempt identity the framework looks a Pod up by,
+// and the task name the per-pod metrics are joined on.
+//
+// Each label is preserved when the task carries it; one that sanitization emptied is
+// simply not there to protect. The managed label comes from the task too, so a
+// framework that doesn't manage Pods through this executor never gets it stamped.
+func PreservedPodLabels(taskCtx pluginsCore.TaskExecutionMetadata) map[string]string {
+	preserved := map[string]string{}
+	if taskCtx == nil {
+		return preserved
+	}
+
+	podLabels := taskCtx.GetLabels()
+	if podLabels[ManagedLabelKey] == ManagedLabelValue {
+		preserved[ManagedLabelKey] = ManagedLabelValue
+	}
+	for _, key := range preservedLabelKeys {
+		if value := podLabels[key]; value != "" {
+			preserved[key] = value
+		}
+	}
+	return preserved
+}
+
+// AttemptPodSelector selects the Pods belonging to this attempt of this action, including
+// the ones an operator expanded from a Pod template a plugin built. It matches only on the
+// labels the framework stamps, so it holds whichever operator created the Pod.
+//
+// It returns nil when any of those labels is missing from the task's execution metadata.
+// The run and action labels go through sanitization and are dropped when nothing survives
+// it, and a selector missing one of them would match another action's Pods, so refusing to
+// select anything is the only safe answer.
+func AttemptPodSelector(taskCtx pluginsCore.TaskExecutionMetadata) labels.Selector {
+	identity := AttemptIdentityLabels(taskCtx)
+	if identity == nil {
+		return nil
+	}
+
+	return labels.SelectorFromValidatedSet(labels.Set(identity))
+}
+
+var migPartitionRegexp = regexp.MustCompile(`^(\d+)g\.\d+gb$`)
+
+// parseMigSlices extracts the compute slice count from a MIG partition size string
+// (e.g. "1g.5gb" → "1", "3g.20gb" → "3"). Returns the slice count as a string,
+// or empty string if the format doesn't match.
+func parseMigSlices(partitionSize string) string {
+	matches := migPartitionRegexp.FindStringSubmatch(partitionSize)
+	if matches == nil {
+		return ""
+	}
+	return matches[1]
+}
+
+var retryableStatusReasons = sets.NewString(
+	// Reasons that indicate the node was preempted aggressively.
+	// Kubelet can miss deleting the pod prior to the node being shutdown.
+	"Shutdown",
+	"Terminated",
+	"NodeShutdown",
+	// kubelet admission rejects the pod before the node gets assigned appropriate labels.
+	"NodeAffinity",
+)
+
+// AddRequiredNodeSelectorRequirements adds the provided v1.NodeSelectorRequirement
+// objects to an existing v1.Affinity object. If there are no existing required
+// node selectors, the new v1.NodeSelectorRequirement will be added as-is.
+// However, if there are existing required node selectors, we iterate over all existing
+// node selector terms and append the node selector requirement. Note that multiple node
+// selector terms are OR'd, and match expressions within a single node selector term
+// are AND'd during scheduling.
+// See: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#node-affinity
+func AddRequiredNodeSelectorRequirements(base *v1.Affinity, new ...v1.NodeSelectorRequirement) {
+	if base.NodeAffinity == nil {
+		base.NodeAffinity = &v1.NodeAffinity{}
+	}
+	if base.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		base.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &v1.NodeSelector{}
+	}
+	if len(base.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms) > 0 {
+		nodeSelectorTerms := base.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+		for i := range nodeSelectorTerms {
+			nst := &nodeSelectorTerms[i]
+			for _, req := range new {
+				if !containsNodeSelectorRequirement(nst.MatchExpressions, req) {
+					nst.MatchExpressions = append(nst.MatchExpressions, req)
+				}
+			}
+		}
+	} else {
+		base.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms = []v1.NodeSelectorTerm{{MatchExpressions: new}}
+	}
+}
+
+// containsNodeSelectorRequirement reports whether reqs already holds an identical
+// requirement, so callers (e.g. ApplyGPUNodeSelectors, which may run more than once
+// on the same pod spec) stay idempotent instead of duplicating match expressions.
+func containsNodeSelectorRequirement(reqs []v1.NodeSelectorRequirement, req v1.NodeSelectorRequirement) bool {
+	for i := range reqs {
+		if reqs[i].Key != req.Key || reqs[i].Operator != req.Operator || len(reqs[i].Values) != len(req.Values) {
+			continue
+		}
+		match := true
+		for j := range req.Values {
+			if reqs[i].Values[j] != req.Values[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// AddPreferredNodeSelectorRequirements appends the provided v1.NodeSelectorRequirement
+// objects to an existing v1.Affinity object's list of preferred scheduling terms.
+// See: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#node-affinity-weight
+// for how weights are used during scheduling.
+func AddPreferredNodeSelectorRequirements(base *v1.Affinity, weight int32, new ...v1.NodeSelectorRequirement) {
+	if base.NodeAffinity == nil {
+		base.NodeAffinity = &v1.NodeAffinity{}
+	}
+	base.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = append(
+		base.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution,
+		v1.PreferredSchedulingTerm{
+			Weight: weight,
+			Preference: v1.NodeSelectorTerm{
+				MatchExpressions: new,
+			},
+		},
+	)
+}
+
+// ApplyInterruptibleNodeSelectorRequirement configures the node selector requirement of the node-affinity using the configuration specified.
+func ApplyInterruptibleNodeSelectorRequirement(interruptible bool, affinity *v1.Affinity) {
+	// Determine node selector terms to add to node affinity
+	var nodeSelectorRequirement v1.NodeSelectorRequirement
+	if interruptible {
+		if config.GetK8sPluginConfig().InterruptibleNodeSelectorRequirement == nil {
+			return
+		}
+		nodeSelectorRequirement = *config.GetK8sPluginConfig().InterruptibleNodeSelectorRequirement
+	} else {
+		if config.GetK8sPluginConfig().NonInterruptibleNodeSelectorRequirement == nil {
+			return
+		}
+		nodeSelectorRequirement = *config.GetK8sPluginConfig().NonInterruptibleNodeSelectorRequirement
+	}
+
+	AddRequiredNodeSelectorRequirements(affinity, nodeSelectorRequirement)
+}
+
+// ApplyInterruptibleNodeAffinity configures the node-affinity for the pod using the configuration specified.
+func ApplyInterruptibleNodeAffinity(interruptible bool, podSpec *v1.PodSpec) {
+	if podSpec.Affinity == nil {
+		podSpec.Affinity = &v1.Affinity{}
+	}
+
+	ApplyInterruptibleNodeSelectorRequirement(interruptible, podSpec.Affinity)
+}
+
+// ApplyPlatformSchedulingConstraints re-applies the platform-injected scheduling
+// constraints that a custom pod-spec merge can dilute or drop, and MUST be called
+// after MergeOverlayPodSpecOntoBase. mergo appends a custom pod's node selector terms
+// as new OR'd alternatives, so any REQUIRED node-affinity requirement the base carried
+// — the configured DefaultAffinity requirements and the (non)interruptible requirement
+// — ends up only on the base term; a pod could then satisfy an appended custom term
+// alone and escape the constraint. This re-adds those requirements to every term and
+// re-applies the interruptible node selector and tolerations. All operations are
+// idempotent (AddRequiredNodeSelectorRequirements / addTolerationInPodSpec skip
+// entries already present), so re-applying to an unmerged base pod is a no-op.
+//
+// Note: DefaultAffinity requirements are AND'd onto every term, which is the intended
+// semantics for the common single-term DefaultAffinity. A DefaultAffinity expressed as
+// multiple OR'd terms would be tightened to AND across those requirements.
+func ApplyPlatformSchedulingConstraints(interruptible bool, podSpec *v1.PodSpec) {
+	if podSpec.Affinity == nil {
+		podSpec.Affinity = &v1.Affinity{}
+	}
+
+	// Re-add the configured DefaultAffinity required requirements to every term.
+	if da := config.GetK8sPluginConfig().DefaultAffinity; da != nil && da.NodeAffinity != nil &&
+		da.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+		for _, term := range da.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+			AddRequiredNodeSelectorRequirements(podSpec.Affinity, term.MatchExpressions...)
+		}
+	}
+
+	// Re-add the (non)interruptible requirement to every term.
+	ApplyInterruptibleNodeSelectorRequirement(interruptible, podSpec.Affinity)
+
+	if !interruptible {
+		return
+	}
+
+	cfg := config.GetK8sPluginConfig()
+	if len(cfg.InterruptibleNodeSelector) > 0 {
+		podSpec.NodeSelector = utils.UnionMaps(podSpec.NodeSelector, cfg.InterruptibleNodeSelector)
+	}
+	// addTolerationInPodSpec is a no-op when the toleration is already present, so
+	// re-applying does not duplicate tolerations seeded earlier by UpdatePod.
+	for i := range cfg.InterruptibleTolerations {
+		addTolerationInPodSpec(podSpec, &cfg.InterruptibleTolerations[i])
+	}
+}
+
+// Specialized merging of overrides into a base *core.ExtendedResources object. Note
+// that doing a nested merge may not be the intended behavior all the time, so we
+// handle each field separately here.
+func ApplyExtendedResourcesOverrides(base, overrides *core.ExtendedResources) *core.ExtendedResources {
+	// Handle case where base might be nil
+	var new *core.ExtendedResources
+	if base == nil {
+		new = &core.ExtendedResources{}
+	} else {
+		new = proto.Clone(base).(*core.ExtendedResources)
+	}
+
+	// No overrides found
+	if overrides == nil {
+		return new
+	}
+
+	// GPU Accelerator
+	if overrides.GetGpuAccelerator() != nil {
+		new.GpuAccelerator = overrides.GetGpuAccelerator()
+	}
+
+	if overrides.GetSharedMemory() != nil {
+		new.SharedMemory = overrides.GetSharedMemory()
+	}
+
+	return new
+}
+
+func ApplySharedMemory(podSpec *v1.PodSpec, primaryContainerName string, SharedMemory *core.SharedMemory) error {
+	sharedMountName := SharedMemory.GetMountName()
+	sharedMountPath := SharedMemory.GetMountPath()
+	if sharedMountName == "" {
+		return pluginserrors.Errorf(pluginserrors.BadTaskSpecification, "mount name is not set")
+	}
+	if sharedMountPath == "" {
+		return pluginserrors.Errorf(pluginserrors.BadTaskSpecification, "mount path is not set")
+	}
+
+	var primaryContainer *v1.Container
+	for index, container := range podSpec.Containers {
+		if container.Name == primaryContainerName {
+			primaryContainer = &podSpec.Containers[index]
+		}
+	}
+	if primaryContainer == nil {
+		return pluginserrors.Errorf(pluginserrors.BadTaskSpecification, "Unable to find primary container")
+	}
+
+	for _, volume := range podSpec.Volumes {
+		if volume.Name == sharedMountName {
+			return pluginserrors.Errorf(pluginserrors.BadTaskSpecification, "A volume is already named %v in pod spec", sharedMountName)
+		}
+	}
+
+	for _, volume_mount := range primaryContainer.VolumeMounts {
+		if volume_mount.Name == sharedMountName {
+			return pluginserrors.Errorf(pluginserrors.BadTaskSpecification, "A volume is already named %v in container", sharedMountName)
+		}
+		if volume_mount.MountPath == sharedMountPath {
+			return pluginserrors.Errorf(pluginserrors.BadTaskSpecification, "%s is already mounted in container", sharedMountPath)
+		}
+	}
+
+	var quantity resource.Quantity
+	var err error
+	if len(SharedMemory.GetSizeLimit()) != 0 {
+		quantity, err = resource.ParseQuantity(SharedMemory.GetSizeLimit())
+		if err != nil {
+			return pluginserrors.Errorf(pluginserrors.BadTaskSpecification, "Unable to parse size limit: %v", err.Error())
+		}
+	}
+
+	podSpec.Volumes = append(
+		podSpec.Volumes,
+		v1.Volume{
+			Name:         sharedMountName,
+			VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{Medium: v1.StorageMediumMemory, SizeLimit: &quantity}},
+		},
+	)
+	primaryContainer.VolumeMounts = append(primaryContainer.VolumeMounts, v1.VolumeMount{Name: sharedMountName, MountPath: sharedMountPath})
+
+	return nil
+}
+
+// getAcceleratorConfig returns the configuration for the given accelerator device class.
+// It first attempts to get device-class-specific configuration from AcceleratorDeviceClasses.
+// If not found or incomplete, it falls back to the global GPU configuration fields for backward compatibility.
+func getAcceleratorConfig(gpuAccelerator *core.GPUAccelerator) config.AcceleratorDeviceClassConfig {
+	cfg := config.GetK8sPluginConfig()
+
+	// Start with defaults from global GPU config
+	accelConfig := config.AcceleratorDeviceClassConfig{
+		ResourceName:                         cfg.GpuResourceName, //nolint: staticcheck
+		DeviceNodeLabel:                      cfg.GpuDeviceNodeLabel,
+		PartitionSizeNodeLabel:               cfg.GpuPartitionSizeNodeLabel,
+		UnpartitionedNodeSelectorRequirement: cfg.GpuUnpartitionedNodeSelectorRequirement,
+		UnpartitionedToleration:              cfg.GpuUnpartitionedToleration,
+	}
+
+	// Override with device-class-specific config if available
+	if gpuAccelerator != nil {
+		deviceClass := gpuAccelerator.GetDeviceClass().String()
+		if deviceClassConfig, ok := cfg.AcceleratorDeviceClasses[deviceClass]; ok {
+			logger.Debugf(context.TODO(), "Using device-class-specific configuration for accelerator class: %s", deviceClass)
+			// Override resource name if specified
+			if deviceClassConfig.ResourceName != "" {
+				accelConfig.ResourceName = deviceClassConfig.ResourceName
+			}
+			// Override device node label if specified
+			if deviceClassConfig.DeviceNodeLabel != "" {
+				accelConfig.DeviceNodeLabel = deviceClassConfig.DeviceNodeLabel
+			}
+			// Override partition size node label if specified
+			if deviceClassConfig.PartitionSizeNodeLabel != "" {
+				accelConfig.PartitionSizeNodeLabel = deviceClassConfig.PartitionSizeNodeLabel
+			}
+			// The partition resource name template has no global counterpart, so it only
+			// comes from the device class.
+			accelConfig.PartitionResourceName = deviceClassConfig.PartitionResourceName
+			// Override unpartitioned node selector requirement if specified
+			if deviceClassConfig.UnpartitionedNodeSelectorRequirement != nil {
+				accelConfig.UnpartitionedNodeSelectorRequirement = deviceClassConfig.UnpartitionedNodeSelectorRequirement
+			}
+			// Override unpartitioned toleration if specified
+			if deviceClassConfig.UnpartitionedToleration != nil {
+				accelConfig.UnpartitionedToleration = deviceClassConfig.UnpartitionedToleration
+			}
+			// Override PodTemplate if specified
+			if deviceClassConfig.PodTemplate != nil {
+				accelConfig.PodTemplate = deviceClassConfig.PodTemplate
+			}
+		} else {
+			logger.Warnf(context.TODO(), "Device class '%s' not found in AcceleratorDeviceClasses configuration, falling back to global GPU config. Available device classes: %v",
+				deviceClass, getConfiguredDeviceClasses(cfg.AcceleratorDeviceClasses))
+		}
+	}
+
+	return accelConfig
+}
+
+func ApplyGPUNodeSelectors(podSpec *v1.PodSpec, gpuAccelerator *core.GPUAccelerator) {
+	// Short circuit if pod spec does not contain any containers that use accelerators
+	if !podRequiresAccelerator(podSpec) {
+		return
+	}
+
+	if podSpec.Affinity == nil {
+		podSpec.Affinity = &v1.Affinity{}
+	}
+
+	// Get device-class-specific configuration
+	accelConfig := getAcceleratorConfig(gpuAccelerator)
+
+	// Apply changes for GPU device
+	if device := gpuAccelerator.GetDevice(); len(device) > 0 {
+		// Normalize the device name
+		normalizedDevice := GetNormalizedAcceleratorDevice(device)
+
+		// Add node selector requirement for GPU device
+		deviceNsr := v1.NodeSelectorRequirement{
+			Key:      accelConfig.DeviceNodeLabel,
+			Operator: v1.NodeSelectorOpIn,
+			Values:   []string{normalizedDevice},
+		}
+		AddRequiredNodeSelectorRequirements(podSpec.Affinity, deviceNsr)
+		// Add toleration for GPU device
+		deviceTol := v1.Toleration{
+			Key:      accelConfig.DeviceNodeLabel,
+			Value:    normalizedDevice,
+			Operator: v1.TolerationOpEqual,
+			Effect:   v1.TaintEffectNoSchedule,
+		}
+		addTolerationInPodSpec(podSpec, &deviceTol)
+	}
+
+	// Short circuit if a partition size preference is not specified
+	partitionSizeValue := gpuAccelerator.GetPartitionSizeValue()
+	if partitionSizeValue == nil {
+		return
+	}
+
+	// Apply changes for GPU partition size, if applicable
+	var partitionSizeNsr *v1.NodeSelectorRequirement
+	var partitionSizeTol *v1.Toleration
+	switch p := partitionSizeValue.(type) {
+	case *core.GPUAccelerator_Unpartitioned:
+		if !p.Unpartitioned {
+			break
+		}
+		if accelConfig.UnpartitionedNodeSelectorRequirement != nil {
+			partitionSizeNsr = accelConfig.UnpartitionedNodeSelectorRequirement
+		} else {
+			partitionSizeNsr = &v1.NodeSelectorRequirement{
+				Key:      accelConfig.PartitionSizeNodeLabel,
+				Operator: v1.NodeSelectorOpDoesNotExist,
+			}
+		}
+		if accelConfig.UnpartitionedToleration != nil {
+			partitionSizeTol = accelConfig.UnpartitionedToleration
+		}
+	case *core.GPUAccelerator_PartitionSize:
+		if _, ok := partitionResourceName(accelConfig, gpuAccelerator); ok {
+			// The container asks for the per-partition resource, which only nodes that
+			// offer this partition advertise, so no partition size affinity is needed.
+			break
+		}
+		partitionSizeNsr = &v1.NodeSelectorRequirement{
+			Key:      accelConfig.PartitionSizeNodeLabel,
+			Operator: v1.NodeSelectorOpIn,
+			Values:   []string{p.PartitionSize},
+		}
+		partitionSizeTol = &v1.Toleration{
+			Key:      accelConfig.PartitionSizeNodeLabel,
+			Value:    p.PartitionSize,
+			Operator: v1.TolerationOpEqual,
+			Effect:   v1.TaintEffectNoSchedule,
+		}
+	}
+	if partitionSizeNsr != nil {
+		AddRequiredNodeSelectorRequirements(podSpec.Affinity, *partitionSizeNsr)
+	}
+	if partitionSizeTol != nil {
+		addTolerationInPodSpec(podSpec, partitionSizeTol)
+	}
+}
+
+// UpdatePod updates the base pod spec used to execute tasks. This is configured with plugins and task metadata-specific options
+func UpdatePod(taskExecutionMetadata pluginsCore.TaskExecutionMetadata,
+	resourceRequirements []v1.ResourceRequirements, podSpec *v1.PodSpec) {
+	if len(podSpec.RestartPolicy) == 0 {
+		podSpec.RestartPolicy = v1.RestartPolicyNever
+	}
+	podSpec.Tolerations = append(
+		GetPodTolerations(taskExecutionMetadata.IsInterruptible(), resourceRequirements...), podSpec.Tolerations...)
+
+	if len(podSpec.ServiceAccountName) == 0 {
+		podSpec.ServiceAccountName = taskExecutionMetadata.GetK8sServiceAccount()
+	}
+	if len(podSpec.SchedulerName) == 0 {
+		podSpec.SchedulerName = config.GetK8sPluginConfig().SchedulerName
+	}
+	podSpec.NodeSelector = utils.UnionMaps(config.GetK8sPluginConfig().DefaultNodeSelector, podSpec.NodeSelector)
+	if taskExecutionMetadata.IsInterruptible() {
+		podSpec.NodeSelector = utils.UnionMaps(podSpec.NodeSelector, config.GetK8sPluginConfig().InterruptibleNodeSelector)
+	}
+	if podSpec.Affinity == nil && config.GetK8sPluginConfig().DefaultAffinity != nil {
+		podSpec.Affinity = config.GetK8sPluginConfig().DefaultAffinity.DeepCopy()
+	}
+	if podSpec.SecurityContext == nil && config.GetK8sPluginConfig().DefaultPodSecurityContext != nil {
+		podSpec.SecurityContext = config.GetK8sPluginConfig().DefaultPodSecurityContext.DeepCopy()
+	}
+	if config.GetK8sPluginConfig().EnableHostNetworkingPod != nil {
+		podSpec.HostNetwork = *config.GetK8sPluginConfig().EnableHostNetworkingPod
+	}
+	if podSpec.DNSConfig == nil && config.GetK8sPluginConfig().DefaultPodDNSConfig != nil {
+		podSpec.DNSConfig = config.GetK8sPluginConfig().DefaultPodDNSConfig.DeepCopy()
+	}
+	ApplyInterruptibleNodeAffinity(taskExecutionMetadata.IsInterruptible(), podSpec)
+}
+
+func mergeMapInto(src map[string]string, dst map[string]string) {
+	for key, value := range src {
+		dst[key] = value
+	}
+}
+
+// BuildRawPod constructs a PodSpec and ObjectMeta based on the definition passed by the TaskExecutionContext. This
+// definition does not include any configuration injected by Flyte.
+func BuildRawPod(ctx context.Context, tCtx pluginsCore.TaskExecutionContext) (*v1.PodSpec, *metav1.ObjectMeta, string, error) {
+	taskTemplate, err := tCtx.TaskReader().Read(ctx)
+	if err != nil {
+		logger.Warnf(ctx, "failed to read task information when trying to construct Pod, err: %s", err.Error())
+		return nil, nil, "", err
+	}
+
+	var podSpec *v1.PodSpec
+	objectMeta := metav1.ObjectMeta{
+		Annotations: make(map[string]string),
+		Labels:      make(map[string]string),
+	}
+	primaryContainerName := ""
+
+	switch target := taskTemplate.GetTarget().(type) {
+	case *core.TaskTemplate_Container:
+		// handles tasks defined by a single container
+		c, err := BuildRawContainer(ctx, tCtx)
+		if err != nil {
+			return nil, nil, "", err
+		}
+
+		primaryContainerName = c.Name
+		podSpec = &v1.PodSpec{
+			Containers: []v1.Container{
+				*c,
+			},
+		}
+
+		// handle pod template override
+		podTemplate := tCtx.TaskExecutionMetadata().GetOverrides().GetPodTemplate()
+		if podTemplate.GetPodSpec() != nil {
+			podSpec, objectMeta, err = ApplyPodTemplateOverride(objectMeta, podTemplate)
+			if err != nil {
+				return nil, nil, "", err
+			}
+			primaryContainerName = podTemplate.GetPrimaryContainerName()
+		}
+
+	case *core.TaskTemplate_K8SPod:
+		// handles pod tasks that marshal the pod spec to the k8s_pod task target.
+		if target.K8SPod.PodSpec == nil {
+			return nil, nil, "", pluginserrors.Errorf(pluginserrors.BadTaskSpecification,
+				"Pod tasks with task type version > 1 should specify their target as a K8sPod with a defined pod spec")
+		}
+
+		err := utils.UnmarshalStructToObj(target.K8SPod.PodSpec, &podSpec) //nolint: staticcheck
+		if err != nil {
+			return nil, nil, "", pluginserrors.Errorf(pluginserrors.BadTaskSpecification,
+				"Unable to unmarshal task k8s pod [%v], Err: [%v]", target.K8SPod.PodSpec, err.Error())
+		}
+
+		// get primary container name
+		var ok bool
+		if primaryContainerName, ok = taskTemplate.GetConfig()[PrimaryContainerKey]; !ok {
+			return nil, nil, "", pluginserrors.Errorf(pluginserrors.BadTaskSpecification,
+				"invalid TaskSpecification, config missing [%s] key in [%v]", PrimaryContainerKey, taskTemplate.GetConfig())
+		}
+
+		// update annotations and labels
+		if taskTemplate.GetK8SPod().Metadata != nil {
+			mergeMapInto(target.K8SPod.Metadata.Annotations, objectMeta.Annotations)
+			mergeMapInto(target.K8SPod.Metadata.Labels, objectMeta.Labels)
+		}
+
+		// handle pod template override
+		podTemplate := tCtx.TaskExecutionMetadata().GetOverrides().GetPodTemplate()
+		if podTemplate.GetPodSpec() != nil {
+			podSpec, objectMeta, err = ApplyPodTemplateOverride(objectMeta, podTemplate)
+			if err != nil {
+				return nil, nil, "", err
+			}
+			primaryContainerName = podTemplate.GetPrimaryContainerName()
+		}
+
+	default:
+		return nil, nil, "", pluginserrors.Errorf(pluginserrors.BadTaskSpecification,
+			"invalid TaskSpecification, unable to determine Pod configuration")
+	}
+
+	enableServiceLinks := false
+	podSpec.EnableServiceLinks = &enableServiceLinks
+
+	return podSpec, &objectMeta, primaryContainerName, nil
+}
+
+func hasExternalLinkType(taskTemplate *core.TaskTemplate) bool {
+	if taskTemplate == nil {
+		return false
+	}
+	config := taskTemplate.GetConfig()
+	if config == nil {
+		return false
+	}
+	// The presence of any "link_type" is sufficient to guarantee that the console URL should be included.
+	_, exists := config["link_type"]
+	return exists
+}
+
+// PodSpecMutator is a hook applied to every pod spec built through
+// ApplyFlytePodConfiguration, after its own construction and template merging.
+// Individual plugins may still adapt the returned spec afterward (e.g. translate
+// it into CRD fields), which can drop mutator changes. Mutators let embedding
+// applications extend pod construction without forking this package. A mutator
+// must be idempotent: the same spec may pass through pod construction more than
+// once.
+type PodSpecMutator func(spec *v1.PodSpec, primaryContainerName string) error
+
+var podSpecMutators struct {
+	m        sync.Mutex
+	mutators []PodSpecMutator
+}
+
+// RegisterPodSpecMutator registers a mutator applied to every pod spec built by
+// ApplyFlytePodConfiguration. Register at startup, before any pods are built.
+func RegisterPodSpecMutator(mutator PodSpecMutator) {
+	podSpecMutators.m.Lock()
+	defer podSpecMutators.m.Unlock()
+	podSpecMutators.mutators = append(podSpecMutators.mutators, mutator)
+}
+
+func applyPodSpecMutators(spec *v1.PodSpec, primaryContainerName string) error {
+	podSpecMutators.m.Lock()
+	mutators := podSpecMutators.mutators
+	podSpecMutators.m.Unlock()
+
+	for _, mutate := range mutators {
+		if err := mutate(spec, primaryContainerName); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ApplyFlytePodConfiguration updates the PodSpec and ObjectMeta with various Flyte configuration. This includes
+// applying default k8s configuration, applying overrides (resources etc.), injecting copilot containers, and merging with the
+// configuration PodTemplate (if exists).
+func ApplyFlytePodConfiguration(ctx context.Context, tCtx pluginsCore.TaskExecutionContext, podSpec *v1.PodSpec, objectMeta *metav1.ObjectMeta, primaryContainerName string) (*v1.PodSpec, *metav1.ObjectMeta, error) {
+	taskTemplate, err := tCtx.TaskReader().Read(ctx)
+	if err != nil {
+		logger.Warnf(ctx, "failed to read task information when trying to construct Pod, err: %s", err.Error())
+		return nil, nil, err
+	}
+
+	// add flyte resource customizations to containers
+	templateParameters := template.Parameters{
+		Inputs:            tCtx.InputReader(),
+		OutputPath:        tCtx.OutputWriter(),
+		Task:              tCtx.TaskReader(),
+		TaskExecMetadata:  tCtx.TaskExecutionMetadata(),
+		IncludeConsoleURL: hasExternalLinkType(taskTemplate),
+	}
+
+	// Merge overrides with base extended resources
+	extendedResources := ApplyExtendedResourcesOverrides(
+		taskTemplate.GetExtendedResources(),
+		tCtx.TaskExecutionMetadata().GetOverrides().GetExtendedResources(),
+	)
+
+	// iterate over the initContainers first
+	for index := range podSpec.InitContainers {
+		var resourceMode = ResourceCustomizationModeEnsureExistingResourcesInRange
+
+		if err := AddFlyteCustomizationsToContainer(ctx, templateParameters, resourceMode, &podSpec.InitContainers[index], extendedResources); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	resourceRequests := make([]v1.ResourceRequirements, 0, len(podSpec.Containers))
+	var primaryContainer *v1.Container
+	for index, container := range podSpec.Containers {
+		var resourceMode = ResourceCustomizationModeEnsureExistingResourcesInRange
+		if container.Name == primaryContainerName {
+			resourceMode = ResourceCustomizationModeMergeExistingResources
+		}
+
+		if err := AddFlyteCustomizationsToContainer(ctx, templateParameters, resourceMode, &podSpec.Containers[index], extendedResources); err != nil {
+			return nil, nil, err
+		}
+
+		resourceRequests = append(resourceRequests, podSpec.Containers[index].Resources)
+		if container.Name == primaryContainerName {
+			primaryContainer = &podSpec.Containers[index]
+		}
+	}
+
+	if primaryContainer == nil {
+		return nil, nil, pluginserrors.Errorf(pluginserrors.BadTaskSpecification, "invalid TaskSpecification, primary container [%s] not defined", primaryContainerName)
+	}
+
+	// add copilot configuration to primaryContainer and PodSpec (if necessary)
+	var dataLoadingConfig *core.DataLoadingConfig
+	if container := taskTemplate.GetContainer(); container != nil {
+		dataLoadingConfig = container.GetDataConfig()
+	} else if pod := taskTemplate.GetK8SPod(); pod != nil {
+		dataLoadingConfig = pod.GetDataConfig()
+	}
+
+	primaryInitContainerName := ""
+
+	if dataLoadingConfig != nil {
+		if err := AddCoPilotToContainer(ctx, config.GetK8sPluginConfig().CoPilot,
+			primaryContainer, taskTemplate.Interface, dataLoadingConfig); err != nil {
+			return nil, nil, err
+		}
+
+		if err := AddCoPilotToPod(ctx, config.GetK8sPluginConfig().CoPilot, podSpec, taskTemplate.GetInterface(),
+			tCtx.TaskExecutionMetadata(), tCtx.InputReader(), tCtx.OutputWriter(), dataLoadingConfig); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	// update primaryContainer and PodSpec with k8s plugin configuration, etc
+	UpdatePod(tCtx.TaskExecutionMetadata(), resourceRequests, podSpec)
+	if primaryContainer.SecurityContext == nil && config.GetK8sPluginConfig().DefaultSecurityContext != nil {
+		primaryContainer.SecurityContext = config.GetK8sPluginConfig().DefaultSecurityContext.DeepCopy()
+	}
+
+	// Apply device-class-specific PodTemplate (if applicable)
+	// This provides device-specific defaults while allowing task configs to override
+	podSpec, err = applyAcceleratorDeviceClassPodTemplate(ctx, podSpec, extendedResources, primaryContainerName, primaryInitContainerName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// merge PodSpec and ObjectMeta with configuration pod template (if exists)
+	podSpec, objectMeta, err = MergeWithBasePodTemplate(ctx, tCtx, podSpec, objectMeta, primaryContainerName, primaryInitContainerName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// GPU accelerator
+	if IsAppleSilicon(extendedResources.GetGpuAccelerator()) {
+		workloadID := tCtx.TaskExecutionMetadata().GetTaskExecutionID().GetGeneratedName()
+		if err := ApplyAppleSiliconBridge(podSpec, primaryContainerName, workloadID); err != nil {
+			return nil, nil, err
+		}
+	} else if extendedResources.GetGpuAccelerator() != nil {
+		ApplyPartitionResourceName(podSpec, extendedResources.GetGpuAccelerator())
+		ApplyGPUNodeSelectors(podSpec, extendedResources.GetGpuAccelerator())
+		if ps, ok := extendedResources.GetGpuAccelerator().GetPartitionSizeValue().(*core.GPUAccelerator_PartitionSize); ok {
+			if slices := parseMigSlices(ps.PartitionSize); slices != "" {
+				if objectMeta.Labels == nil {
+					objectMeta.Labels = make(map[string]string)
+				}
+				objectMeta.Labels[GpuPartitionSlicesLabel] = slices
+			}
+		}
+	}
+
+	// Shared memory volume
+	if extendedResources.GetSharedMemory() != nil {
+		err = ApplySharedMemory(podSpec, primaryContainerName, extendedResources.GetSharedMemory())
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	// Override container image if necessary
+	if len(tCtx.TaskExecutionMetadata().GetOverrides().GetContainerImage()) > 0 {
+		ApplyContainerImageOverride(podSpec, tCtx.TaskExecutionMetadata().GetOverrides().GetContainerImage(), primaryContainerName)
+	}
+
+	// apply registered pod spec mutators last so they observe the fully built spec
+	if err := applyPodSpecMutators(podSpec, primaryContainerName); err != nil {
+		return nil, nil, err
+	}
+
+	return podSpec, objectMeta, nil
+}
+
+func IsVscodeEnabled(ctx context.Context, envVar []v1.EnvVar) bool {
+	for _, env := range envVar {
+		if env.Name != FlyteEnableVscode {
+			continue
+		}
+		var err error
+		enableVscode, err := strconv.ParseBool(env.Value)
+		if err != nil {
+			logger.Errorf(ctx, "failed to parse %s env var: [%s]", FlyteEnableVscode, env.Value)
+			return false
+		}
+		return enableVscode
+	}
+	return false
+}
+
+func ApplyContainerImageOverride(podSpec *v1.PodSpec, containerImage string, primaryContainerName string) {
+	for i, c := range podSpec.Containers {
+		if c.Name == primaryContainerName {
+			podSpec.Containers[i].Image = containerImage
+			return
+		}
+	}
+}
+
+func ApplyPodTemplateOverride(objectMeta metav1.ObjectMeta, podTemplate *core.K8SPod) (*v1.PodSpec, metav1.ObjectMeta, error) {
+	if podTemplate.GetMetadata().GetAnnotations() != nil {
+		mergeMapInto(podTemplate.GetMetadata().GetAnnotations(), objectMeta.Annotations)
+	}
+	if podTemplate.GetMetadata().GetLabels() != nil {
+		mergeMapInto(podTemplate.GetMetadata().GetLabels(), objectMeta.Labels)
+	}
+
+	var podSpecOverride *v1.PodSpec
+	err := utils.UnmarshalStructToObj(podTemplate.GetPodSpec(), &podSpecOverride) //nolint: staticcheck
+	if err != nil {
+		return nil, objectMeta, err
+	}
+
+	return podSpecOverride, objectMeta, nil
+}
+
+func addTolerationInPodSpec(podSpec *v1.PodSpec, toleration *v1.Toleration) *v1.PodSpec {
+	podTolerations := podSpec.Tolerations
+
+	var newTolerations []v1.Toleration
+	for i := range podTolerations {
+		if toleration.MatchToleration(&podTolerations[i]) {
+			return podSpec
+		}
+		newTolerations = append(newTolerations, podTolerations[i])
+	}
+	newTolerations = append(newTolerations, *toleration)
+	podSpec.Tolerations = newTolerations
+	return podSpec
+}
+
+func AddTolerationsForExtendedResources(podSpec *v1.PodSpec) *v1.PodSpec {
+	if podSpec == nil {
+		podSpec = &v1.PodSpec{}
+	}
+
+	// A per-partition accelerator resource such as nvidia.com/mig-1g.5gb also counts as a
+	// request for its device class's resource name, because the partitioned nodes carry the
+	// same taints as the rest of that device class.
+	requested := sets.NewString()
+	collectRequested := func(containers []v1.Container) {
+		for _, container := range containers {
+			for name := range container.Resources.Requests {
+				requested.Insert(name.String())
+				if base, ok := acceleratorBaseResourceName(name); ok {
+					requested.Insert(base.String())
+				}
+			}
+		}
+	}
+	collectRequested(podSpec.Containers)
+	collectRequested(podSpec.InitContainers)
+
+	resources := sets.NewString()
+	for _, extendedResource := range config.GetK8sPluginConfig().AddTolerationsForExtendedResources {
+		if requested.Has(extendedResource) {
+			resources.Insert(extendedResource)
+		}
+	}
+
+	for _, resource := range resources.List() {
+		addTolerationInPodSpec(podSpec, &v1.Toleration{
+			Key:      resource,
+			Operator: v1.TolerationOpExists,
+			Effect:   v1.TaintEffectNoSchedule,
+		})
+	}
+
+	return podSpec
+}
+
+// ToK8sPodSpec builds a PodSpec and ObjectMeta based on the definition passed by the TaskExecutionContext. This
+// involves parsing the raw PodSpec definition and applying all Flyte configuration options.
+func ToK8sPodSpec(ctx context.Context, tCtx pluginsCore.TaskExecutionContext) (*v1.PodSpec, *metav1.ObjectMeta, string, error) {
+	// build raw PodSpec and ObjectMeta
+	podSpec, objectMeta, primaryContainerName, err := BuildRawPod(ctx, tCtx)
+	if err != nil {
+		return nil, nil, "", err
+	}
+
+	// add flyte configuration
+	podSpec, objectMeta, err = ApplyFlytePodConfiguration(ctx, tCtx, podSpec, objectMeta, primaryContainerName)
+	if err != nil {
+		return nil, nil, "", err
+	}
+
+	podSpec = AddTolerationsForExtendedResources(podSpec)
+
+	return podSpec, objectMeta, primaryContainerName, nil
+}
+
+func GetContainer(podSpec *v1.PodSpec, name string) (*v1.Container, error) {
+	for _, container := range podSpec.Containers {
+		if container.Name == name {
+			return &container, nil
+		}
+	}
+	return nil, pluginserrors.Errorf(pluginserrors.BadTaskSpecification, "invalid TaskSpecification, container [%s] not defined", name)
+}
+
+// getBasePodTemplate attempts to retrieve the PodTemplate to use as the base for k8s Pod configuration. This value can
+// come from one of the following:
+// (1) PodTemplate name in the TaskMetadata: This name is then looked up in the PodTemplateStore.
+// (2) Default PodTemplate name from configuration: This name is then looked up in the PodTemplateStore.
+func getBasePodTemplate(ctx context.Context, tCtx pluginsCore.TaskExecutionContext, podTemplateStore PodTemplateStore) (*v1.PodTemplate, error) {
+	taskTemplate, err := tCtx.TaskReader().Read(ctx)
+	if err != nil {
+		return nil, pluginserrors.Errorf(pluginserrors.BadTaskSpecification, "TaskSpecification cannot be read, Err: [%v]", err.Error())
+	}
+
+	var podTemplate *v1.PodTemplate
+	if taskTemplate.Metadata != nil && len(taskTemplate.Metadata.PodTemplateName) > 0 {
+		// retrieve PodTemplate by name from PodTemplateStore
+		podTemplate = podTemplateStore.LoadOrDefault(tCtx.TaskExecutionMetadata().GetNamespace(), taskTemplate.Metadata.PodTemplateName)
+		if podTemplate == nil {
+			return nil, pluginserrors.Errorf(pluginserrors.BadTaskSpecification, "PodTemplate '%s' does not exist", taskTemplate.Metadata.PodTemplateName)
+		}
+	} else {
+		// check for default PodTemplate
+		podTemplate = podTemplateStore.LoadOrDefault(tCtx.TaskExecutionMetadata().GetNamespace(), config.GetK8sPluginConfig().DefaultPodTemplateName)
+	}
+
+	return podTemplate, nil
+}
+
+// MergeWithBasePodTemplate attempts to merge the provided PodSpec and ObjectMeta with the configuration PodTemplate for
+// this task.
+func MergeWithBasePodTemplate(ctx context.Context, tCtx pluginsCore.TaskExecutionContext,
+	podSpec *v1.PodSpec, objectMeta *metav1.ObjectMeta, primaryContainerName, primaryInitContainerName string) (*v1.PodSpec, *metav1.ObjectMeta, error) {
+
+	// attempt to retrieve base PodTemplate
+	podTemplate, err := getBasePodTemplate(ctx, tCtx, DefaultPodTemplateStore)
+	if err != nil {
+		return nil, nil, err
+	} else if podTemplate == nil {
+		// if no PodTemplate to merge as base -> return
+		return podSpec, objectMeta, nil
+	}
+
+	// merge podTemplate onto podSpec
+	templateSpec := &podTemplate.Template.Spec
+	mergedPodSpec, err := MergeBasePodSpecOntoTemplate(templateSpec, podSpec, primaryContainerName, primaryInitContainerName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// merge PodTemplate PodSpec with podSpec
+	var mergedObjectMeta = podTemplate.Template.ObjectMeta.DeepCopy()
+	if err := mergo.Merge(mergedObjectMeta, objectMeta, mergo.WithOverride, mergo.WithAppendSlice); err != nil {
+		return nil, nil, err
+	}
+
+	return mergedPodSpec, mergedObjectMeta, nil
+}
+
+// MergeBasePodSpecOntoTemplate merges a base pod spec onto a template pod spec. The template pod spec has some
+// magic values that allow users to specify templates that target all containers and primary containers. Aside from
+// magic values this method will merge containers that have matching names.
+func MergeBasePodSpecOntoTemplate(templatePodSpec *v1.PodSpec, basePodSpec *v1.PodSpec, primaryContainerName string, primaryInitContainerName string) (*v1.PodSpec, error) {
+	if templatePodSpec == nil || basePodSpec == nil {
+		return nil, errors.New("neither the templatePodSpec or the basePodSpec can be nil")
+	}
+
+	// extract primaryContainerTemplate. The base should always contain the primary container.
+	var defaultContainerTemplate, primaryContainerTemplate *v1.Container
+
+	// extract default container template
+	for i := 0; i < len(templatePodSpec.Containers); i++ {
+		switch templatePodSpec.Containers[i].Name {
+		case defaultContainerTemplateName:
+			defaultContainerTemplate = &templatePodSpec.Containers[i]
+		case primaryContainerTemplateName:
+			primaryContainerTemplate = &templatePodSpec.Containers[i]
+		}
+	}
+
+	// extract primaryInitContainerTemplate. The base should always contain the primary container.
+	var defaultInitContainerTemplate, primaryInitContainerTemplate *v1.Container
+
+	// extract defaultInitContainerTemplate
+	for i := 0; i < len(templatePodSpec.InitContainers); i++ {
+		switch templatePodSpec.InitContainers[i].Name {
+		case defaultInitContainerTemplateName:
+			defaultInitContainerTemplate = &templatePodSpec.InitContainers[i]
+		case primaryInitContainerTemplateName:
+			primaryInitContainerTemplate = &templatePodSpec.InitContainers[i]
+		}
+	}
+
+	// Merge base into template
+	mergedPodSpec := templatePodSpec.DeepCopy()
+	if err := mergo.Merge(mergedPodSpec, basePodSpec, mergo.WithOverride, mergo.WithAppendSlice); err != nil {
+		return nil, err
+	}
+
+	// merge PodTemplate containers
+	var mergedContainers []v1.Container
+	for _, container := range basePodSpec.Containers {
+		// if applicable start with defaultContainerTemplate
+		var mergedContainer *v1.Container
+		if defaultContainerTemplate != nil {
+			mergedContainer = defaultContainerTemplate.DeepCopy()
+		}
+
+		// If this is a primary container handle the template
+		if container.Name == primaryContainerName && primaryContainerTemplate != nil {
+			if mergedContainer == nil {
+				mergedContainer = primaryContainerTemplate.DeepCopy()
+			} else {
+				err := mergo.Merge(mergedContainer, primaryContainerTemplate, mergo.WithOverride, mergo.WithAppendSlice)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		// Check for any name matching template containers
+		for i, templateContainer := range templatePodSpec.Containers {
+			if templateContainer.Name != container.Name {
+				continue
+			}
+
+			// skip "default" and "primary" magic template containers as they are already
+			// merged above. Without this guard, WithAppendSlice causes duplicate
+			// VolumeMounts / EnvVars when the base container name collides with a
+			// magic template name.
+			if templateContainer.Name == defaultContainerTemplateName || templateContainer.Name == primaryContainerTemplateName {
+				continue
+			}
+
+			if mergedContainer == nil {
+				mergedContainer = &templatePodSpec.Containers[i]
+			} else {
+				err := mergo.Merge(mergedContainer, templateContainer, mergo.WithOverride, mergo.WithAppendSlice)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		// Merge in the base container
+		if mergedContainer == nil {
+			mergedContainer = container.DeepCopy()
+		} else {
+			err := mergo.Merge(mergedContainer, container, mergo.WithOverride, mergo.WithAppendSlice)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		mergedContainers = append(mergedContainers, *mergedContainer)
+
+	}
+
+	mergedPodSpec.Containers = mergedContainers
+
+	// merge PodTemplate init containers
+	var mergedInitContainers []v1.Container
+	for _, initContainer := range basePodSpec.InitContainers {
+		// if applicable start with defaultContainerTemplate
+		var mergedInitContainer *v1.Container
+		if defaultInitContainerTemplate != nil {
+			mergedInitContainer = defaultInitContainerTemplate.DeepCopy()
+		}
+
+		// If this is a primary init container handle the template
+		if initContainer.Name == primaryInitContainerName && primaryInitContainerTemplate != nil {
+			if mergedInitContainer == nil {
+				mergedInitContainer = primaryInitContainerTemplate.DeepCopy()
+			} else {
+				err := mergo.Merge(mergedInitContainer, primaryInitContainerTemplate, mergo.WithOverride, mergo.WithAppendSlice)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		// Check for any name matching template containers
+		for i, templateInitContainer := range templatePodSpec.InitContainers {
+			if templateInitContainer.Name != initContainer.Name {
+				continue
+			}
+
+			// skip "default-init" and "primary-init" magic template containers as they
+			// are already merged above. Without this guard, WithAppendSlice causes
+			// duplicate VolumeMounts / EnvVars when the base init container name
+			// collides with a magic template name.
+			if templateInitContainer.Name == defaultInitContainerTemplateName || templateInitContainer.Name == primaryInitContainerTemplateName {
+				continue
+			}
+
+			if mergedInitContainer == nil {
+				mergedInitContainer = &templatePodSpec.InitContainers[i]
+			} else {
+				err := mergo.Merge(mergedInitContainer, templateInitContainer, mergo.WithOverride, mergo.WithAppendSlice)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		// Merge in the base init container
+		if mergedInitContainer == nil {
+			mergedInitContainer = initContainer.DeepCopy()
+		} else {
+			err := mergo.Merge(mergedInitContainer, initContainer, mergo.WithOverride, mergo.WithAppendSlice)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		mergedInitContainers = append(mergedInitContainers, *mergedInitContainer)
+	}
+
+	mergedPodSpec.InitContainers = mergedInitContainers
+
+	return mergedPodSpec, nil
+}
+
+// MergeOverlayPodSpecOntoBase merges a customized pod spec onto a base pod spec. At a container level it will
+// merge containers that have matching names.
+func MergeOverlayPodSpecOntoBase(basePodSpec *v1.PodSpec, overlayPodSpec *v1.PodSpec) (*v1.PodSpec, error) {
+	if basePodSpec == nil || overlayPodSpec == nil {
+		return nil, errors.New("neither the basePodSpec or the overlayPodSpec can be nil")
+	}
+
+	mergedPodSpec := basePodSpec.DeepCopy()
+	if err := mergo.Merge(mergedPodSpec, overlayPodSpec, mergo.WithOverride, mergo.WithAppendSlice); err != nil {
+		return nil, err
+	}
+
+	// merge PodTemplate containers
+	var mergedContainers []v1.Container
+	for _, container := range basePodSpec.Containers {
+
+		mergedContainer := container.DeepCopy()
+
+		for _, overlayContainer := range overlayPodSpec.Containers {
+			if mergedContainer.Name == overlayContainer.Name {
+				err := mergo.Merge(mergedContainer, overlayContainer, mergo.WithOverride, mergo.WithAppendSlice)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		mergedContainers = append(mergedContainers, *mergedContainer)
+	}
+
+	mergedPodSpec.Containers = mergedContainers
+
+	// merge PodTemplate init containers
+	var mergedInitContainers []v1.Container
+	for _, initContainer := range basePodSpec.InitContainers {
+
+		mergedInitContainer := initContainer.DeepCopy()
+
+		for _, overlayInitContainer := range overlayPodSpec.InitContainers {
+			if mergedInitContainer.Name == overlayInitContainer.Name {
+				err := mergo.Merge(mergedInitContainer, overlayInitContainer, mergo.WithOverride, mergo.WithAppendSlice)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		mergedInitContainers = append(mergedInitContainers, *mergedInitContainer)
+	}
+
+	mergedPodSpec.InitContainers = mergedInitContainers
+
+	return mergedPodSpec, nil
+}
+
+// applyAcceleratorDeviceClassPodTemplate applies device-class-specific PodTemplate configuration
+// to the provided PodSpec using MergeBasePodSpecOntoTemplate. The device class PodTemplate serves as a base,
+// with task PodSpec values taking precedence.
+//
+// See AcceleratorDeviceClassConfig.PodTemplate documentation for detailed merge semantics,
+// precedence rules, and container template support.
+func applyAcceleratorDeviceClassPodTemplate(
+	ctx context.Context,
+	podSpec *v1.PodSpec,
+	extendedResources *core.ExtendedResources,
+	primaryContainerName string,
+	primaryInitContainerName string,
+) (*v1.PodSpec, error) {
+	if extendedResources == nil || extendedResources.GetGpuAccelerator() == nil {
+		return podSpec, nil
+	}
+
+	gpuAccelerator := extendedResources.GetGpuAccelerator()
+	accelConfig := getAcceleratorConfig(gpuAccelerator)
+
+	if accelConfig.PodTemplate == nil {
+		return podSpec, nil
+	}
+
+	deviceClass := gpuAccelerator.GetDeviceClass().String()
+	logger.Infof(ctx, "Applying PodTemplate for accelerator device class: %s", deviceClass)
+
+	// Use MergeBasePodSpecOntoTemplate with device class pod template as base
+	mergedPodSpec, err := MergeBasePodSpecOntoTemplate(&accelConfig.PodTemplate.Template.Spec, podSpec, primaryContainerName, primaryInitContainerName)
+	if err != nil {
+		return nil, pluginserrors.Wrapf(
+			pluginserrors.DownstreamSystemError,
+			err,
+			"Failed to merge PodTemplate for accelerator device class '%s'. "+
+				"Check k8s.accelerator-device-classes[%s].pod-template configuration.",
+			deviceClass, deviceClass,
+		)
+	}
+
+	return mergedPodSpec, nil
+}
+
+func BuildIdentityPod() *v1.Pod {
+	return &v1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       PodKind,
+			APIVersion: v1.SchemeGroupVersion.String(),
+		},
+	}
+}
+
+// DemystifyPending is one the core functions, that helps FlytePropeller determine if a pending pod is indeed pending,
+// or it is actually stuck in a un-reparable state. In such a case the pod should be marked as dead and the task should
+// be retried. This has to be handled sadly, as K8s is still largely designed for long running services that should
+// recover from failures, but Flyte pods are completely automated and should either run or fail
+// Important considerations.
+// Pending Status in Pod could be for various reasons and sometimes could signal a problem
+// Case I: Pending because the Image pull is failing and it is backing off
+//
+//	This could be transient. So we can actually rely on the failure reason.
+//	The failure transitions from ErrImagePull -> ImagePullBackoff
+//
+// Case II: Not enough resources are available. This is tricky. It could be that the total number of
+//
+//	resources requested is beyond the capability of the system. for this we will rely on configuration
+//	and hence input gates. We should not allow bad requests that Request for large number of resource through.
+//	In the case it makes through, we will fail after timeout
+func DemystifyPending(status v1.PodStatus, info pluginsCore.TaskInfo) (pluginsCore.PhaseInfo, error) {
+	phaseInfo, t := demystifyPendingHelper(status, info)
+
+	if phaseInfo.Phase().IsTerminal() {
+		return phaseInfo, nil
+	}
+
+	podPendingTimeout := config.GetK8sPluginConfig().PodPendingTimeout.Duration
+	if podPendingTimeout > 0 && time.Since(t) >= podPendingTimeout {
+		return pluginsCore.PhaseInfoSystemRetryableFailureWithCleanup("PodPendingTimeout", phaseInfo.Reason(), &pluginsCore.TaskInfo{
+			OccurredAt: &t,
+		}), nil
+	}
+
+	if phaseInfo.Phase() != pluginsCore.PhaseUndefined {
+		return phaseInfo, nil
+	}
+
+	return pluginsCore.PhaseInfoQueuedWithTaskInfo(time.Now(), pluginsCore.DefaultPhaseVersion, "Scheduling", phaseInfo.Info()), nil
+}
+
+// DemystifyFailedOrPendingPod inspects the pod status of a failed or pending pod and attempts to determine the reason
+// for the failure or pending state. This function currently only handles pods in the Failed or Pending phase.
+// This is useful to check the specific error from the pod in the rayjob, sparkjob, etc.
+// For example, if the pod is in the Failed phase due to an image pull error, this function can return a more specific
+// error message indicating that the image could not be pulled.
+// Similarly, if the pod is in the Pending phase due to insufficient resources, this function can return an error
+// message indicating that the pod could not be scheduled due to lack of resources.
+func DemystifyFailedOrPendingPod(
+	ctx context.Context,
+	pluginContext k8s.PluginContext,
+	info pluginsCore.TaskInfo,
+	namespace string,
+	podName string,
+	primaryContainerName string,
+) (pluginsCore.PhaseInfo, error) {
+	pod := &v1.Pod{}
+	var phaseInfo pluginsCore.PhaseInfo
+
+	err := pluginContext.K8sReader().Get(ctx, client.ObjectKey{Namespace: namespace, Name: podName}, pod)
+	if err != nil {
+		logger.Debugf(ctx, "Failed to get pod %s in namespace %s. Error: %v", podName, namespace, err)
+	}
+	switch pod.Status.Phase {
+	case v1.PodFailed:
+		phaseInfo, err = DemystifyFailure(ctx, pod.Status, info, primaryContainerName)
+	case v1.PodPending:
+		phaseInfo, err = DemystifyPending(pod.Status, info)
+	}
+	return phaseInfo, err
+}
+
+func demystifyPendingHelper(status v1.PodStatus, info pluginsCore.TaskInfo) (pluginsCore.PhaseInfo, time.Time) {
+	// Search over the difference conditions in the status object.  Note that the 'Pending' this function is
+	// demystifying is the 'phase' of the pod status. This is different than the PodReady condition type also used below
+	phaseInfo := pluginsCore.PhaseInfoQueuedWithTaskInfo(time.Now(), pluginsCore.DefaultPhaseVersion, "Demistify Pending", &info)
+
+	t := time.Now()
+	for _, c := range status.Conditions {
+		t = c.LastTransitionTime.Time
+		switch c.Type {
+		case v1.PodScheduled:
+			if c.Status == v1.ConditionFalse {
+				// Waiting to be scheduled. This usually refers to inability to acquire resources.
+				return pluginsCore.PhaseInfoQueuedWithTaskInfo(t, pluginsCore.DefaultPhaseVersion, fmt.Sprintf("%s:%s", c.Reason, c.Message), phaseInfo.Info()), t
+			}
+
+		case v1.PodReasonUnschedulable:
+			// We Ignore case in which we are unable to find resources on the cluster. This is because
+			// - The resources may be not available at the moment, but may become available eventually
+			//   The pod scheduler will keep on looking at this pod and trying to satisfy it.
+			//
+			//  Pod status looks like this:
+			// 	message: '0/1 nodes are available: 1 Insufficient memory.'
+			//  reason: Unschedulable
+			// 	status: "False"
+			// 	type: PodScheduled
+			return pluginsCore.PhaseInfoQueuedWithTaskInfo(t, pluginsCore.DefaultPhaseVersion, fmt.Sprintf("%s:%s", c.Reason, c.Message), phaseInfo.Info()), t
+
+		case v1.PodReady:
+			if c.Status == v1.ConditionFalse {
+				// This happens in the case the image is having some problems. In the following example, K8s is having
+				// problems downloading an image. To ensure that, we will have to iterate over all the container statuses and
+				// find if some container has imagepull failure
+				// e.g.
+				//     - lastProbeTime: null
+				//      lastTransitionTime: 2018-12-18T00:57:30Z
+				//      message: 'containers with unready status: [myapp-container]'
+				//      reason: ContainersNotReady
+				//      status: "False"
+				//      type: Ready
+				//
+				// e.g. Container status
+				//     - image: blah
+				//      imageID: ""
+				//      lastState: {}
+				//      name: myapp-container
+				//      ready: false
+				//      restartCount: 0
+				//      state:
+				//        waiting:
+				//          message: Back-off pulling image "blah"
+				//          reason: ImagePullBackOff
+
+				// Init containers run before regular containers; a stuck init container is
+				// the causal signal when main containers are merely reporting PodInitializing.
+				// Inspect init container statuses first so failures like ImagePullBackOff on
+				// an init container surface with the correct reason/classification rather
+				// than being masked by the downstream PodInitializing wait on the main container.
+				for _, containerStatus := range status.InitContainerStatuses {
+					if containerStatus.State.Waiting != nil {
+						return classifyWaitingContainer(containerStatus.State.Waiting, c, t)
+					}
+				}
+				for _, containerStatus := range status.ContainerStatuses {
+					if !containerStatus.Ready {
+						if containerStatus.State.Waiting != nil {
+							return classifyWaitingContainer(containerStatus.State.Waiting, c, t)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return phaseInfo, t
+}
+
+// classifyWaitingContainer maps a container's Waiting state (from either ContainerStatuses or
+// InitContainerStatuses) to a Flyte PhaseInfo, applying per-reason grace periods and failure
+// classifications. t is the condition's LastTransitionTime used as the grace-period clock —
+// matching the pre-existing semantics for regular containers.
+func classifyWaitingContainer(waiting *v1.ContainerStateWaiting, c v1.PodCondition, t time.Time) (pluginsCore.PhaseInfo, time.Time) {
+	// There are a variety of reasons that can cause a pod to be in this waiting state.
+	// Waiting state may be legitimate when the container is being downloaded, started or init containers are running
+	reason := waiting.Reason
+	finalReason := fmt.Sprintf("%s|%s", c.Reason, reason)
+	finalMessage := fmt.Sprintf("%s|%s", c.Message, waiting.Message)
+	switch reason {
+	case "ErrImagePull", "ContainerCreating", "PodInitializing":
+		// But, there are only two "reasons" when a pod is successfully being created and hence it is in
+		// waiting state
+		// Refer to https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kubelet_pods.go
+		// and look for the default waiting states
+		// We also want to allow Image pulls to be retried, so ErrImagePull will be ignored
+		// as it eventually enters into ImagePullBackOff
+		// ErrImagePull -> Transitionary phase to ImagePullBackOff
+		// ContainerCreating -> Image is being downloaded
+		// PodInitializing -> Init containers are running
+		return pluginsCore.PhaseInfoInitializing(t, pluginsCore.DefaultPhaseVersion, fmt.Sprintf("[%s]: %s", finalReason, finalMessage), &pluginsCore.TaskInfo{OccurredAt: &t}), t
+
+	case "CreateContainerError":
+		// This may consist of:
+		// 1. Transient errors: e.g. failed to reserve
+		// container name, container name [...] already in use
+		// by container
+		// 2. Permanent errors: e.g. no command specified
+		// To handle both types of errors gracefully without
+		// arbitrary pattern matching in the message, we simply
+		// allow a grace period for kubelet to resolve
+		// transient issues with the container runtime. If the
+		// error persists beyond this time, the corresponding
+		// task is marked as failed.
+		// NOTE: The current implementation checks for a timeout
+		// by comparing the condition's LastTransitionTime
+		// based on the corresponding kubelet's clock with the
+		// current time based on FlytePropeller's clock. This
+		// is not ideal given that these 2 clocks are NOT
+		// synced, and therefore, only provides an
+		// approximation of the elapsed time since the last
+		// transition.
+
+		gracePeriod := config.GetK8sPluginConfig().CreateContainerErrorGracePeriod.Duration
+		if time.Since(t) >= gracePeriod {
+			return pluginsCore.PhaseInfoFailureWithCleanup(finalReason, GetMessageAfterGracePeriod(finalMessage, gracePeriod), &pluginsCore.TaskInfo{
+				OccurredAt: &t,
+			}), t
+		}
+		return pluginsCore.PhaseInfoInitializing(
+			t,
+			pluginsCore.DefaultPhaseVersion,
+			fmt.Sprintf("[%s]: %s", finalReason, finalMessage),
+			&pluginsCore.TaskInfo{OccurredAt: &t},
+		), t
+
+	case "CreateContainerConfigError":
+		gracePeriod := config.GetK8sPluginConfig().CreateContainerConfigErrorGracePeriod.Duration
+		if time.Since(t) >= gracePeriod {
+			return pluginsCore.PhaseInfoFailureWithCleanup(finalReason, GetMessageAfterGracePeriod(finalMessage, gracePeriod), &pluginsCore.TaskInfo{
+				OccurredAt: &t,
+			}), t
+		}
+		return pluginsCore.PhaseInfoInitializing(
+			t,
+			pluginsCore.DefaultPhaseVersion,
+			fmt.Sprintf("[%s]: %s", finalReason, finalMessage),
+			&pluginsCore.TaskInfo{OccurredAt: &t},
+		), t
+
+	case "InvalidImageName":
+		return pluginsCore.PhaseInfoFailureWithCleanup(finalReason, finalMessage, &pluginsCore.TaskInfo{
+			OccurredAt: &t,
+		}), t
+
+	case "ImagePullBackOff":
+		gracePeriod := config.GetK8sPluginConfig().ImagePullBackoffGracePeriod.Duration
+		if time.Since(t) >= gracePeriod {
+			if isRegistryRateLimited(waiting.Message) {
+				// Registry rate limiting (HTTP 429) is not caused by the user
+				// and is a transient infrastructure problem. Classify as a
+				// system-retryable failure so it does not consume the user's
+				// retry budget.
+				return pluginsCore.PhaseInfoSystemRetryableFailureWithCleanup(finalReason, GetMessageAfterGracePeriod(finalMessage, gracePeriod), &pluginsCore.TaskInfo{
+					OccurredAt: &t,
+				}), t
+			}
+			return pluginsCore.PhaseInfoRetryableFailureWithCleanup(finalReason, GetMessageAfterGracePeriod(finalMessage, gracePeriod), &pluginsCore.TaskInfo{
+				OccurredAt: &t,
+			}), t
+		}
+
+		return pluginsCore.PhaseInfoInitializing(
+			t,
+			pluginsCore.DefaultPhaseVersion,
+			fmt.Sprintf("[%s]: %s", finalReason, finalMessage),
+			&pluginsCore.TaskInfo{OccurredAt: &t},
+		), t
+
+	default:
+		// Since we are not checking for all error states, we may end up perpetually
+		// in the queued state returned at the bottom of this function, until the Pod is reaped
+		// by K8s and we get elusive 'pod not found' errors
+		// So be default if the container is not waiting with the PodInitializing/ContainerCreating
+		// reasons, then we will assume a failure reason, and fail instantly
+		return pluginsCore.PhaseInfoSystemRetryableFailureWithCleanup(finalReason, finalMessage, &pluginsCore.TaskInfo{
+			OccurredAt: &t,
+		}), t
+	}
+}
+
+func GetMessageAfterGracePeriod(message string, gracePeriod time.Duration) string {
+	return fmt.Sprintf("Grace period [%s] exceeded|%s", gracePeriod, message)
+}
+
+// isRegistryRateLimited reports whether an ImagePullBackOff message indicates
+// the container runtime hit HTTP 429 Too Many Requests against the image
+// registry — a transient infrastructure failure outside the user's control.
+func isRegistryRateLimited(message string) bool {
+	return strings.Contains(message, "429 Too Many Requests")
+}
+
+func DemystifySuccess(status v1.PodStatus, info pluginsCore.TaskInfo) (pluginsCore.PhaseInfo, error) {
+	for _, status := range append(
+		append(status.InitContainerStatuses, status.ContainerStatuses...), status.EphemeralContainerStatuses...) {
+		if status.State.Terminated != nil && strings.Contains(status.State.Terminated.Reason, OOMKilled) {
+			return pluginsCore.PhaseInfoRetryableFailure(OOMKilled,
+				"Pod reported success despite being OOMKilled", &info), nil
+		}
+	}
+	return pluginsCore.PhaseInfoSuccess(&info), nil
+}
+
+// DeterminePrimaryContainerPhase as the name suggests, given all the containers, will return a pluginsCore.PhaseInfo object
+// corresponding to the phase of the primaryContainer which is identified using the provided name.
+// This is useful in case of sidecars or pod jobs, where Flyte will monitor successful exit of a single container.
+func DeterminePrimaryContainerPhase(ctx context.Context, primaryContainerName string, statuses []v1.ContainerStatus, info *pluginsCore.TaskInfo) pluginsCore.PhaseInfo {
+	for _, s := range statuses {
+		if s.Name == primaryContainerName {
+			if s.State.Waiting != nil || s.State.Running != nil {
+				return pluginsCore.PhaseInfoRunning(pluginsCore.DefaultPhaseVersion, info)
+			}
+
+			if s.State.Terminated != nil {
+				message := fmt.Sprintf("\r\n[%v] terminated with exit code (%v). Reason [%v]. Message: \n%v.",
+					s.Name,
+					s.State.Terminated.ExitCode,
+					s.State.Terminated.Reason,
+					s.State.Terminated.Message)
+
+				var phaseInfo pluginsCore.PhaseInfo
+				switch {
+				case strings.Contains(s.State.Terminated.Reason, OOMKilled):
+					// OOMKilled typically results in a SIGKILL signal, but we classify it as a user error
+					phaseInfo = pluginsCore.PhaseInfoRetryableFailure(
+						s.State.Terminated.Reason, message, info)
+				case isTerminatedWithSigKill(s.State):
+					// If the primary container exited with SIGKILL, we treat it as a system-level error
+					// (such as node termination or preemption). This best-effort approach accepts some false positives.
+					// In the case that node preemption terminates the kubelet *before* the kubelet is able to persist
+					// the pod's state to the Kubernetes API server, we rely on Kubernetes to eventually resolve
+					// the state. This will enable Propeller to eventually query the API server and determine that
+					// the pod no longer exists, which will then be counted as a system error.
+					phaseInfo = pluginsCore.PhaseInfoSystemRetryableFailure(
+						s.State.Terminated.Reason, message, info)
+				case s.State.Terminated.ExitCode != 0:
+					phaseInfo = pluginsCore.PhaseInfoRetryableFailure(
+						s.State.Terminated.Reason, message, info)
+				default:
+					return pluginsCore.PhaseInfoSuccess(info)
+				}
+
+				logger.Warnf(ctx, "Primary container terminated with issue. Message: '%s'", message)
+				return phaseInfo
+			}
+		}
+	}
+
+	// If for some reason we can't find the primary container, always just return a permanent failure
+	return pluginsCore.PhaseInfoFailure(PrimaryContainerNotFound,
+		fmt.Sprintf("Primary container [%s] not found in pod's container statuses", primaryContainerName), info)
+}
+
+// DemystifyFailure resolves the various Kubernetes pod failure modes to determine
+// the most appropriate course of action
+func DemystifyFailure(ctx context.Context, status v1.PodStatus, info pluginsCore.TaskInfo, primaryContainerName string) (pluginsCore.PhaseInfo, error) {
+	code := "UnknownError"
+	message := "Pod failed. No message received from kubernetes."
+	if len(status.Reason) > 0 {
+		code = status.Reason
+	}
+
+	if len(status.Message) > 0 {
+		message = status.Message
+	}
+
+	//
+	// Handle known pod statuses
+	//
+	// This is useful for handling node interruption events
+	// which can be different between providers and versions of Kubernetes. Given that
+	// we don't have a consistent way of detecting interruption events, we will be
+	// documenting all possibilities as follows. We will also be handling these as
+	// system retryable failures that do not count towards user-specified task retries,
+	// for now. This is required for FlytePropeller to correctly transition
+	// interruptible nodes to non-interruptible ones after the
+	// `interruptible-failure-threshold` is exceeded. See:
+	// https://github.com/flyteorg/flytepropeller/blob/a3c6e91f19c19601a957b29891437112868845de/pkg/controller/nodes/node_exec_context.go#L213
+
+	// GKE (>= v1.20) Kubelet graceful node shutdown
+	// See: https://cloud.google.com/kubernetes-engine/docs/how-to/preemptible-vms#graceful-shutdown
+	// Cloud audit log for patch of Pod object during graceful node shutdown:
+	// request: {
+	//     @type: "k8s.io/Patch"
+	//     status: {
+	//         conditions: null
+	//         message: "Pod Node is in progress of shutting down, not admitting any new pods"
+	//         phase: "Failed"
+	//         qosClass: null
+	//         reason: "Shutdown"
+	//         startTime: "2022-01-30T14:24:07Z"
+	//     }
+	// }
+	//
+
+	var isSystemError bool
+	// A controller that stopped the pod on purpose, such as Kueue preempting its Workload, says
+	// so on the pod itself. Its reason is the code and its message the explanation; the container
+	// exit codes below still add detail, but do not get to rename the failure.
+	terminationTarget := GetTerminationTarget(status, primaryContainerName)
+	if terminationTarget != nil {
+		code = ExternalTerminationCode(terminationTarget)
+		message = ExternalTerminationMessage(terminationTarget)
+		isSystemError = true
+	}
+	// In some versions of GKE the reason can also be "Terminated" or "NodeShutdown"
+	if retryableStatusReasons.Has(code) {
+		isSystemError = true
+	}
+
+	//
+	// Handle known container statuses
+	//
+	for _, c := range append(
+		append(status.InitContainerStatuses, status.ContainerStatuses...), status.EphemeralContainerStatuses...) {
+		var containerState v1.ContainerState
+		if c.LastTerminationState.Terminated != nil {
+			containerState = c.LastTerminationState
+		} else if c.State.Terminated != nil {
+			containerState = c.State
+		}
+		if containerState.Terminated != nil {
+			switch {
+			case terminationTarget != nil:
+				// The controller's reason stands; the exit code below is only detail.
+			case strings.Contains(containerState.Terminated.Reason, OOMKilled):
+				code = OOMKilled
+			case isTerminatedWithSigKill(containerState):
+				// in some setups, node termination sends SIGKILL to all the containers running on that node. Capturing and
+				// tagging that correctly.
+				code = Interrupted
+				// If the primary container exited with SIGKILL, we treat it as a system-level error
+				// (such as node termination or preemption). This best-effort approach accepts some false positives.
+				// In the case that node preemption terminates the kubelet *before* the kubelet is able to persist
+				// the pod's state to the Kubernetes API server, we rely on Kubernetes to eventually resolve
+				// the state. This will enable Propeller to eventually query the API server and determine that
+				// the pod no longer exists, which will then be counted as a system error.
+				if c.Name == primaryContainerName {
+					isSystemError = true
+				}
+			}
+
+			if containerState.Terminated.ExitCode == 0 {
+				message += fmt.Sprintf("\r\n[%v] terminated with ExitCode 0.", c.Name)
+			} else {
+				message += fmt.Sprintf("\r\n[%v] terminated with exit code (%v). Reason [%v]. Message: \n%v.",
+					c.Name,
+					containerState.Terminated.ExitCode,
+					containerState.Terminated.Reason,
+					containerState.Terminated.Message)
+			}
+		}
+	}
+
+	// A container that exited non-zero on its own is the application reporting failure, not the
+	// missing kubelet record the fallback below assumes. Only main containers are considered: the
+	// co-pilot runs as init containers. When a pod has exactly one main container, that
+	// container's exit status is taken as the task's result.
+	if code == "UnknownError" && len(status.ContainerStatuses) == 1 {
+		if t := status.ContainerStatuses[0].State.Terminated; t != nil &&
+			t.ExitCode > 0 && t.ExitCode <= maxUserExitCode && !isTerminationStatusSynthesized(t) {
+			if t.Reason != "" {
+				code = t.Reason
+			} else {
+				code = ContainerFailed
+			}
+		}
+	}
+
+	// If the code remains 'UnknownError', it indicates that the kubelet did not have a chance
+	// to record a more specific failure before the node was terminated or preempted.
+	// In such cases, we classify the error as system-level and accept false positives.
+	// The node vanishing is an interruption, and 'UnknownError' says nothing to the user,
+	// so the code is replaced rather than kept.
+	if code == "UnknownError" {
+		isSystemError = true
+		code = Interrupted
+	}
+
+	if isSystemError {
+		logger.Warnf(ctx, "Pod failed with a system error. Code: %s, Message: %s", code, message)
+		// Report the code we worked out rather than flattening every system error to
+		// 'Interrupted'. A retryable status reason such as 'Shutdown' or 'NodeShutdown'
+		// tells the user what actually happened to the node, and it is the only place
+		// that information exists by the time the failure reaches them. The SIGKILL and
+		// vanished-node branches above set 'Interrupted' on purpose and still report it.
+		return pluginsCore.PhaseInfoSystemRetryableFailure(code, message, &info), nil
+	}
+
+	logger.Warnf(ctx, "Pod failed with a user error. Code: %s, Message: %s", code, message)
+	return pluginsCore.PhaseInfoRetryableFailure(code, message, &info), nil
+}
+
+// isTerminationStatusSynthesized reports whether a container's terminated status was fabricated by
+// the runtime rather than observed from the application. When the pod is torn down before the
+// container finishes, the kubelet cannot read the termination log and reports a placeholder exit
+// code, in practice 2. That code says nothing about what the container did, so it must not be used
+// to attribute the failure to the user.
+func isTerminationStatusSynthesized(t *v1.ContainerStateTerminated) bool {
+	return t != nil && strings.Contains(t.Message, terminationMessageReadFailure)
+}
+
+func GetLastTransitionOccurredAt(pod *v1.Pod) metav1.Time {
+	var lastTransitionTime metav1.Time
+	containerStatuses := append(pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses...)
+	for _, containerStatus := range containerStatuses {
+		if r := containerStatus.State.Running; r != nil {
+			if r.StartedAt.Unix() > lastTransitionTime.Unix() {
+				lastTransitionTime = r.StartedAt
+			}
+		} else if r := containerStatus.State.Terminated; r != nil {
+			if r.FinishedAt.Unix() > lastTransitionTime.Unix() {
+				lastTransitionTime = r.FinishedAt
+			}
+		}
+	}
+
+	if lastTransitionTime.IsZero() {
+		lastTransitionTime = metav1.NewTime(time.Now())
+	}
+
+	return lastTransitionTime
+}
+
+// PodFailureTime is the time a pod's own trouble is anchored on, which is what a GPU
+// fault's relevance is measured against (see gpufault.RelevantToFailure).
+//
+// A container's termination is stamped by the kubelet on the same node and clock as the
+// fault events, so it is the closest thing to the moment a fault would have to explain. A
+// pod on its way out without a terminated container is anchored on its deletion, which is
+// what an eviction leaves behind.
+//
+// Only then does the time the caller already had stand in, and it is the last resort on
+// purpose. Callers typically get it from GetLastTransitionOccurredAt above, which for a
+// pod that failed while its containers were still running reports the time the container
+// started, not the time anything went wrong. Anchoring a long-running task on its own
+// start would put every real fault outside the window and quietly find nothing. Pass the
+// zero time when there is no such time to offer, and the current time is used instead.
+//
+// Init containers are not eligible, which is where this parts company with
+// GetLastTransitionOccurredAt. They finish before the workload starts, and a native
+// sidecar declared among them is reaped after everything else, so either would anchor on
+// a moment that has nothing to do with when the work died.
+func PodFailureTime(pod *v1.Pod, occurredAt time.Time) time.Time {
+	latest := time.Time{}
+	for _, status := range pod.Status.ContainerStatuses {
+		terminated := status.State.Terminated
+		if terminated == nil || terminated.FinishedAt.IsZero() {
+			continue
+		}
+		if terminated.FinishedAt.After(latest) {
+			latest = terminated.FinishedAt.Time
+		}
+	}
+
+	switch {
+	case !latest.IsZero():
+		return latest
+	case pod.DeletionTimestamp != nil && !pod.DeletionTimestamp.IsZero():
+		return pod.DeletionTimestamp.Time
+	case !occurredAt.IsZero():
+		return occurredAt
+	default:
+		return time.Now()
+	}
+}
+
+func GetReportedAt(pod *v1.Pod) metav1.Time {
+	var reportedAt metav1.Time
+	for _, condition := range pod.Status.Conditions {
+		if condition.Reason == "PodCompleted" && condition.Type == v1.PodReady && condition.Status == v1.ConditionFalse {
+			if condition.LastTransitionTime.Unix() > reportedAt.Unix() {
+				reportedAt = condition.LastTransitionTime
+			}
+		}
+	}
+
+	return reportedAt
+}
+
+// DeclaredPrimaryContainerName is the name of the container running the task's own work,
+// when something actually said which one that is. It reads only the annotations, so an
+// empty result means nobody declared a primary container, not that the pod has none.
+//
+// GetPrimaryContainerName below answers a different question: it always names some
+// container, guessing the first one when nothing was declared. That guess is right often
+// enough for logs and diagnostics, but a caller deciding whether the task's own work
+// finished cannot act on a guess, because the container it happens to pick may be an
+// injected sidecar.
+func DeclaredPrimaryContainerName(pod *v1.Pod) string {
+	// Flyte's own annotation outranks the kubectl one. The framework stamps it at
+	// build time on every template it owns, while default-container is a kubectl
+	// display convenience a user may point at a sidecar through pod metadata; a
+	// user-facing preference must not decide which container's exit settles fault
+	// classification. The kubectl annotation still answers for pods Flyte did not
+	// stamp, where any declaration beats guessing.
+	if primary := pod.Annotations[PrimaryContainerKey]; primary != "" {
+		return primary
+	}
+	return pod.Annotations["kubectl.kubernetes.io/default-container"]
+}
+
+func GetPrimaryContainerName(pod *v1.Pod) string {
+	if declared := DeclaredPrimaryContainerName(pod); declared != "" {
+		return declared
+	}
+
+	for _, container := range pod.Spec.Containers {
+		if container.Name == pod.Name {
+			return container.Name
+		}
+	}
+
+	// default to just 1st container name
+	if len(pod.Spec.Containers) > 0 {
+		return pod.Spec.Containers[0].Name
+	}
+	return ""
+}
+
+func makeContainerContexts(statuses []v1.ContainerStatus) []*core.ContainerContext {
+	ctxs := make([]*core.ContainerContext, len(statuses))
+	for i, status := range statuses {
+		var startTime, endTime *timestamppb.Timestamp
+		if status.State.Running != nil {
+			startTime = timestamppb.New(status.State.Running.StartedAt.Time)
+		}
+		if status.State.Terminated != nil {
+			startTime = timestamppb.New(status.State.Terminated.StartedAt.Time)
+			endTime = timestamppb.New(status.State.Terminated.FinishedAt.Time)
+		}
+		ctxs[i] = &core.ContainerContext{
+			ContainerName: status.Name,
+			Process: &core.ContainerContext_ProcessContext{
+				ContainerStartTime: startTime,
+				ContainerEndTime:   endTime,
+			},
+		}
+	}
+	return ctxs
+}
+
+func BuildPodLogContext(pod *v1.Pod) *core.PodLogContext {
+	return &core.PodLogContext{
+		Namespace:            pod.Namespace,
+		PodName:              pod.Name,
+		PrimaryContainerName: GetPrimaryContainerName(pod),
+		Containers:           makeContainerContexts(pod.Status.ContainerStatuses),
+		InitContainers:       makeContainerContexts(pod.Status.InitContainerStatuses),
+	}
+}
+
+func isTerminatedWithSigKill(state v1.ContainerState) bool {
+	return state.Terminated != nil && (state.Terminated.ExitCode == SIGKILL || state.Terminated.ExitCode == unsignedSIGKILL)
+}

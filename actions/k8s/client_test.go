@@ -1,0 +1,1311 @@
+package k8s
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/genproto/googleapis/rpc/status"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
+	toolscache "k8s.io/client-go/tools/cache"
+	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	executorv1 "github.com/flyteorg/flyte/v2/executor/api/v1"
+	"github.com/flyteorg/flyte/v2/flytestdlib/fastcheck"
+	"github.com/flyteorg/flyte/v2/flytestdlib/promutils"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/actions"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/common"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/core"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/task"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/workflow"
+	runmocks "github.com/flyteorg/flyte/v2/gen/go/flyteidl2/workflow/workflowconnect/mocks"
+)
+
+func newTestActionUpdate(actionName string) (*executorv1.TaskAction, *ActionUpdate) {
+	runID := &common.RunIdentifier{
+		Project: "proj",
+		Domain:  "dev",
+		Name:    "run1",
+	}
+	ta := &executorv1.TaskAction{
+		Spec: executorv1.TaskActionSpec{
+			Project:    runID.Project,
+			Domain:     runID.Domain,
+			RunName:    runID.Name,
+			ActionName: actionName,
+		},
+	}
+	update := &ActionUpdate{
+		ActionID: &common.ActionIdentifier{
+			Run:  runID,
+			Name: actionName,
+		},
+	}
+	return ta, update
+}
+
+func TestNotifyRunService_DeduplicateRecordAction(t *testing.T) {
+	ctx := context.Background()
+
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+
+	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	assert.NoError(t, err)
+
+	c := &ActionsClient{
+		runClient:      mockClient,
+		recordedFilter: filter,
+		subscribers:    make(map[string]map[chan *ActionUpdate]struct{}),
+	}
+
+	ta, update := newTestActionUpdate("action-1")
+
+	// Expect RecordAction called exactly once
+	mockClient.On("RecordAction", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.RecordActionResponse]{}, nil).Once()
+
+	// First Added event — should call RecordAction
+	c.notifyRunService(ctx, ta, update, watch.Added)
+
+	// Second Added event (replay) — should be deduplicated
+	c.notifyRunService(ctx, ta, update, watch.Added)
+
+	mockClient.AssertNumberOfCalls(t, "RecordAction", 1)
+}
+
+func TestNotifyRunService_FailedRecordAllowsRetry(t *testing.T) {
+	ctx := context.Background()
+
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+
+	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	assert.NoError(t, err)
+
+	c := &ActionsClient{
+		runClient:      mockClient,
+		recordedFilter: filter,
+		subscribers:    make(map[string]map[chan *ActionUpdate]struct{}),
+	}
+
+	ta, update := newTestActionUpdate("action-2")
+
+	// First call fails
+	mockClient.On("RecordAction", mock.Anything, mock.Anything).
+		Return((*connect.Response[workflow.RecordActionResponse])(nil), fmt.Errorf("transient error")).Once()
+	// Second call succeeds
+	mockClient.On("RecordAction", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.RecordActionResponse]{}, nil).Once()
+
+	// First event — RecordAction fails, should NOT add to filter
+	c.notifyRunService(ctx, ta, update, watch.Added)
+
+	// Second event — should retry RecordAction since first failed
+	c.notifyRunService(ctx, ta, update, watch.Added)
+
+	mockClient.AssertNumberOfCalls(t, "RecordAction", 2)
+
+	// Third event — now it's in the filter, should be skipped
+	c.notifyRunService(ctx, ta, update, watch.Added)
+	mockClient.AssertNumberOfCalls(t, "RecordAction", 2)
+}
+
+func TestNotifyRunService_UpdateActionStatusIncludesAttemptsAndCacheStatus(t *testing.T) {
+	ctx := context.Background()
+
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+	c := &ActionsClient{
+		recordedFilter: testFilter(),
+		runClient:      mockClient,
+		subscribers:    make(map[string]map[chan *ActionUpdate]struct{}),
+	}
+
+	ta, update := newTestActionUpdate("action-4")
+	ta.Status.Attempts = 3
+	ta.Status.CacheStatus = core.CatalogCacheStatus_CACHE_HIT
+	update.Phase = common.ActionPhase_ACTION_PHASE_SUCCEEDED
+
+	mockClient.On("UpdateActionStatus", mock.Anything, mock.MatchedBy(func(req *connect.Request[workflow.UpdateActionStatusRequest]) bool {
+		status := req.Msg.GetStatus()
+		return status.GetPhase() == common.ActionPhase_ACTION_PHASE_SUCCEEDED &&
+			status.GetAttempts() == 3 &&
+			status.GetCacheStatus() == core.CatalogCacheStatus_CACHE_HIT
+	})).Return(&connect.Response[workflow.UpdateActionStatusResponse]{}, nil).Once()
+	// First-sight MODIFIED now also records (deduped via the mandatory filter).
+	mockClient.On("RecordAction", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.RecordActionResponse]{}, nil).Maybe()
+
+	c.notifyRunService(ctx, ta, update, watch.Modified)
+
+	mockClient.AssertNumberOfCalls(t, "UpdateActionStatus", 1)
+}
+
+// TestNotifyRunService_RejectedStatusUpdateSkipsTerminalLabel covers the bug
+// where UpdateActionStatus reports the rejection in-band via resp.Status
+// instead of a transport error. Before the fix, notifyRunService only checked
+// the transport error, so a rejected terminal update was still marked
+// terminal-status-recorded, permanently preventing retries.
+func TestNotifyRunService_RejectedStatusUpdateSkipsTerminalLabel(t *testing.T) {
+	ctx := context.Background()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, executorv1.AddToScheme(scheme))
+
+	ta := &executorv1.TaskAction{
+		ObjectMeta: metav1.ObjectMeta{Name: "run1-action-5", Namespace: "flyte"},
+		Spec: executorv1.TaskActionSpec{
+			Project:    "proj",
+			Domain:     "dev",
+			RunName:    "run1",
+			ActionName: "action-5",
+		},
+	}
+
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+	c := &ActionsClient{
+		runClient:      mockClient,
+		recordedFilter: testFilter(),
+		subscribers:    make(map[string]map[chan *ActionUpdate]struct{}),
+		k8sClient: fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(ta.DeepCopy()).
+			Build(),
+	}
+
+	update := &ActionUpdate{
+		ActionID: &common.ActionIdentifier{
+			Run:  &common.RunIdentifier{Project: "proj", Domain: "dev", Name: "run1"},
+			Name: "action-5",
+		},
+		Phase: common.ActionPhase_ACTION_PHASE_SUCCEEDED,
+	}
+
+	// Transport succeeds (err == nil), but the run service rejects the write
+	// in-band — e.g. a DB failure — and reports it via resp.Status.
+	mockClient.On("UpdateActionStatus", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.UpdateActionStatusResponse]{
+			Msg: &workflow.UpdateActionStatusResponse{
+				Status: &status.Status{Code: int32(codes.Internal), Message: "db write failed"},
+			},
+		}, nil).Once()
+	mockClient.On("RecordAction", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.RecordActionResponse]{}, nil).Maybe()
+
+	c.notifyRunService(ctx, ta, update, watch.Modified)
+
+	mockClient.AssertNumberOfCalls(t, "UpdateActionStatus", 1)
+
+	var got executorv1.TaskAction
+	require.NoError(t, c.k8sClient.Get(ctx, client.ObjectKeyFromObject(ta), &got))
+	assert.NotEqual(t, "true", got.GetLabels()[labelTerminalStatusRecorded],
+		"terminal-status-recorded must not be set when the run service rejects the update")
+}
+
+func TestBuildTaskActionName(t *testing.T) {
+	runID := &common.RunIdentifier{
+		Project: "project",
+		Domain:  "development",
+		Name:    "rabc123",
+	}
+
+	t.Run("root action uses a0 suffix", func(t *testing.T) {
+		// Root: action name == run name
+		actionID := &common.ActionIdentifier{
+			Run:  runID,
+			Name: runID.Name,
+		}
+		assert.Equal(t, "rabc123-a0", buildTaskActionName(actionID))
+	})
+
+	t.Run("child action includes action name", func(t *testing.T) {
+		actionID := &common.ActionIdentifier{
+			Run:  runID,
+			Name: "train",
+		}
+		assert.Equal(t, "rabc123-train", buildTaskActionName(actionID))
+	})
+}
+
+func TestExtractTaskCacheKey(t *testing.T) {
+	t.Run("returns cache key for task action", func(t *testing.T) {
+		action := &actions.Action{
+			Spec: &actions.Action_Task{
+				Task: &workflow.TaskAction{
+					CacheKey: wrapperspb.String("cache-v1"),
+				},
+			},
+		}
+
+		assert.Equal(t, "cache-v1", extractTaskCacheKey(action))
+	})
+
+	t.Run("returns empty for non-task action", func(t *testing.T) {
+		assert.Empty(t, extractTaskCacheKey(&actions.Action{}))
+	})
+}
+
+func TestEmbedTaskTemplate_SubstitutesRunStartTime(t *testing.T) {
+	startTime := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+
+	newAction := func() *actions.Action {
+		return &actions.Action{
+			Spec: &actions.Action_Task{
+				Task: &workflow.TaskAction{
+					Spec: &task.TaskSpec{
+						TaskTemplate: &core.TaskTemplate{
+							Type: "python",
+							Target: &core.TaskTemplate_Container{
+								Container: &core.Container{
+									Args: []string{"a0", "--run-start-time", runStartTimeTemplateVar, "--name", "{{.actionName}}"},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	embedded := func(action *actions.Action) *core.TaskTemplate {
+		ta := &executorv1.TaskAction{Spec: executorv1.TaskActionSpec{}}
+		require.NoError(t, embedTaskTemplate(action, ta, &task.RunSpec{RunStartTime: timestamppb.New(startTime)}))
+		out := &core.TaskTemplate{}
+		require.NoError(t, proto.Unmarshal(ta.Spec.TaskTemplate, out))
+		return out
+	}
+
+	t.Run("replaces the placeholder with the RFC3339 run start time", func(t *testing.T) {
+		action := newAction()
+		out := embedded(action)
+		assert.Equal(t,
+			[]string{"a0", "--run-start-time", "2026-06-03T12:00:00Z", "--name", "{{.actionName}}"},
+			out.GetContainer().GetArgs())
+		// The caller's proto must be left untouched (it is persisted separately as the task spec).
+		assert.Equal(t, runStartTimeTemplateVar,
+			action.GetSpec().(*actions.Action_Task).Task.Spec.TaskTemplate.GetContainer().GetArgs()[2])
+	})
+
+	t.Run("no-op when run start time is unset", func(t *testing.T) {
+		ta := &executorv1.TaskAction{Spec: executorv1.TaskActionSpec{}}
+		require.NoError(t, embedTaskTemplate(newAction(), ta, &task.RunSpec{}))
+		out := &core.TaskTemplate{}
+		require.NoError(t, proto.Unmarshal(ta.Spec.TaskTemplate, out))
+		assert.Equal(t, runStartTimeTemplateVar, out.GetContainer().GetArgs()[2])
+	})
+
+	t.Run("no-op when template has no placeholder (older SDK)", func(t *testing.T) {
+		action := &actions.Action{
+			Spec: &actions.Action_Task{
+				Task: &workflow.TaskAction{
+					Spec: &task.TaskSpec{
+						TaskTemplate: &core.TaskTemplate{
+							Target: &core.TaskTemplate_Container{
+								Container: &core.Container{Args: []string{"pyflyte-execute", "--inputs", "{{.input}}"}},
+							},
+						},
+					},
+				},
+			},
+		}
+		out := embedded(action)
+		assert.Equal(t, []string{"pyflyte-execute", "--inputs", "{{.input}}"}, out.GetContainer().GetArgs())
+	})
+}
+
+func TestApplyRunSpecToTaskAction_ProjectsRuntimeSettings(t *testing.T) {
+	taskAction := &executorv1.TaskAction{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				"flyte.org/run": "run1",
+			},
+		},
+		Spec: executorv1.TaskActionSpec{},
+	}
+
+	applyRunSpecToTaskAction(taskAction, &task.RunSpec{
+		Envs: &task.Envs{
+			Values: []*core.KeyValuePair{
+				{Key: "TRACE_ID", Value: "abc123"},
+			},
+		},
+		Interruptible:  wrapperspb.Bool(true),
+		RawDataStorage: &task.RawDataStorage{RawDataPrefix: "s3://raw-bucket/prefix"},
+		Labels: &task.Labels{
+			Values: map[string]string{
+				"flyte.org/run": "should-not-override",
+				"team":          "platform",
+			},
+		},
+		Annotations: &task.Annotations{
+			Values: map[string]string{
+				"owner": "sdk",
+			},
+		},
+		DefaultSettings: &task.DefaultSettings{
+			PodTemplateName: "gpu-template",
+		},
+	})
+
+	require.NotNil(t, taskAction.Spec.Interruptible)
+	assert.True(t, *taskAction.Spec.Interruptible)
+	assert.Len(t, taskAction.Spec.EnvVars, 1)
+	assert.Equal(t, "abc123", taskAction.Spec.EnvVars["TRACE_ID"])
+	assert.Equal(t, "s3://raw-bucket/prefix", taskAction.Spec.RawDataPrefix)
+	assert.Equal(t, "run1", taskAction.Labels["flyte.org/run"])
+	assert.Equal(t, "platform", taskAction.Labels["team"])
+	assert.Equal(t, "sdk", taskAction.Annotations["owner"])
+	assert.Equal(t, "gpu-template", taskAction.Spec.PodTemplateName)
+}
+
+func TestApplyRunSpecToTaskAction_RawDataPrefix(t *testing.T) {
+	t.Run("unset prefix stays empty", func(t *testing.T) {
+		ta := &executorv1.TaskAction{}
+		applyRunSpecToTaskAction(ta, &task.RunSpec{})
+		assert.Empty(t, ta.Spec.RawDataPrefix)
+	})
+
+	t.Run("nil run spec clears a stale prefix", func(t *testing.T) {
+		ta := &executorv1.TaskAction{Spec: executorv1.TaskActionSpec{RawDataPrefix: "s3://stale"}}
+		applyRunSpecToTaskAction(ta, nil)
+		assert.Empty(t, ta.Spec.RawDataPrefix)
+	})
+}
+
+func TestInheritRunContextFromParentTaskAction(t *testing.T) {
+	interruptible := true
+	parent := &executorv1.TaskAction{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				"team": "platform",
+			},
+			Annotations: map[string]string{
+				"owner": "sdk",
+			},
+		},
+		Spec: executorv1.TaskActionSpec{
+			EnvVars: map[string]string{
+				"TRACE_ID": "abc123",
+				"TEAM":     "platform",
+			},
+			Interruptible:   &interruptible,
+			PodTemplateName: "gpu-template",
+			RawDataPrefix:   "s3://raw-bucket/prefix",
+		},
+	}
+
+	child := &executorv1.TaskAction{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				"flyte.org/run": "run1",
+			},
+		},
+		Spec: executorv1.TaskActionSpec{},
+	}
+
+	inheritRunContextFromParentTaskAction(child, parent)
+
+	require.NotNil(t, child.Spec.Interruptible)
+	assert.True(t, *child.Spec.Interruptible)
+	assert.Equal(t, parent.Spec.EnvVars, child.Spec.EnvVars)
+	assert.Equal(t, "s3://raw-bucket/prefix", child.Spec.RawDataPrefix)
+	assert.Equal(t, "platform", child.Labels["team"])
+	assert.Equal(t, "run1", child.Labels["flyte.org/run"])
+	assert.Equal(t, "sdk", child.Annotations["owner"])
+	assert.Equal(t, "gpu-template", child.Spec.PodTemplateName)
+
+	// Verify deep copy (child mutation must not mutate parent map).
+	child.Spec.EnvVars["TRACE_ID"] = "mutated"
+	assert.Equal(t, "abc123", parent.Spec.EnvVars["TRACE_ID"])
+	child.Annotations["owner"] = "mutated"
+	assert.Equal(t, "sdk", parent.Annotations["owner"])
+}
+
+func TestInheritRunContextFromParentTaskAction_DoesNotOverrideExistingLabels(t *testing.T) {
+	parentInterruptible := true
+	parent := &executorv1.TaskAction{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				"flyte.org/run": "should-not-override",
+				"team":          "platform",
+			},
+		},
+		Spec: executorv1.TaskActionSpec{
+			EnvVars: map[string]string{
+				"TRACE_ID": "parent",
+				"TEAM":     "platform",
+			},
+			Interruptible: &parentInterruptible,
+		},
+	}
+
+	child := &executorv1.TaskAction{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				"flyte.org/run": "run1",
+			},
+		},
+		Spec: executorv1.TaskActionSpec{},
+	}
+
+	inheritRunContextFromParentTaskAction(child, parent)
+
+	require.NotNil(t, child.Spec.Interruptible)
+	assert.True(t, *child.Spec.Interruptible)
+	assert.Equal(t, map[string]string{"TRACE_ID": "parent", "TEAM": "platform"}, child.Spec.EnvVars)
+	assert.Equal(t, "run1", child.Labels["flyte.org/run"])
+	assert.Equal(t, "platform", child.Labels["team"])
+}
+
+func TestApplyPodTemplateName(t *testing.T) {
+	tests := []struct {
+		name string
+		tmpl *core.TaskTemplate
+		give string
+		want string
+	}{
+		{
+			name: "a task naming no template takes the given name",
+			tmpl: &core.TaskTemplate{},
+			give: "gpu-template",
+			want: "gpu-template",
+		},
+		{
+			name: "a task naming its own template keeps it",
+			tmpl: &core.TaskTemplate{Metadata: &core.TaskMetadata{PodTemplateName: "task-template"}},
+			give: "gpu-template",
+			want: "task-template",
+		},
+		{
+			name: "an empty name changes nothing",
+			tmpl: &core.TaskTemplate{},
+			give: "",
+			want: "",
+		},
+		{
+			name: "existing metadata without a name takes it",
+			tmpl: &core.TaskTemplate{Metadata: &core.TaskMetadata{DiscoveryVersion: "v1"}},
+			give: "gpu-template",
+			want: "gpu-template",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := applyPodTemplateName(tt.tmpl, tt.give)
+			assert.Equal(t, tt.want, got.GetMetadata().GetPodTemplateName())
+		})
+	}
+}
+
+// TestApplyPodTemplateName_DoesNotMutateInput guards the clone. The caller's template
+// may be persisted separately as the registered task spec, so stamping must leave the
+// original untouched and must carry over whatever metadata it already had.
+func TestApplyPodTemplateName_DoesNotMutateInput(t *testing.T) {
+	withMetadata := &core.TaskTemplate{Metadata: &core.TaskMetadata{DiscoveryVersion: "v1"}}
+	got := applyPodTemplateName(withMetadata, "gpu-template")
+
+	assert.Equal(t, "gpu-template", got.GetMetadata().GetPodTemplateName())
+	assert.Equal(t, "v1", got.GetMetadata().GetDiscoveryVersion())
+	assert.Empty(t, withMetadata.GetMetadata().GetPodTemplateName())
+
+	withoutMetadata := &core.TaskTemplate{}
+	got = applyPodTemplateName(withoutMetadata, "gpu-template")
+
+	assert.Equal(t, "gpu-template", got.GetMetadata().GetPodTemplateName())
+	assert.Nil(t, withoutMetadata.GetMetadata())
+}
+
+func TestEmbedTaskTemplate_StampsPodTemplateName(t *testing.T) {
+	newAction := func() *actions.Action {
+		return &actions.Action{
+			Spec: &actions.Action_Task{
+				Task: &workflow.TaskAction{
+					Spec: &task.TaskSpec{
+						TaskTemplate: &core.TaskTemplate{Type: "python"},
+					},
+				},
+			},
+		}
+	}
+
+	embedded := func(action *actions.Action, name string) *core.TaskTemplate {
+		ta := &executorv1.TaskAction{Spec: executorv1.TaskActionSpec{PodTemplateName: name}}
+		require.NoError(t, embedTaskTemplate(action, ta, &task.RunSpec{}))
+		out := &core.TaskTemplate{}
+		require.NoError(t, proto.Unmarshal(ta.Spec.TaskTemplate, out))
+		return out
+	}
+
+	t.Run("stamps the projected name onto a task that names none", func(t *testing.T) {
+		action := newAction()
+		out := embedded(action, "gpu-template")
+		assert.Equal(t, "gpu-template", out.GetMetadata().GetPodTemplateName())
+		// The caller's proto must be left untouched (it is persisted separately as the task spec).
+		assert.Empty(t, action.GetSpec().(*actions.Action_Task).Task.Spec.TaskTemplate.GetMetadata().GetPodTemplateName())
+	})
+
+	t.Run("no-op when the action carries no name", func(t *testing.T) {
+		out := embedded(newAction(), "")
+		assert.Empty(t, out.GetMetadata().GetPodTemplateName())
+	})
+}
+
+func TestNotifyRunService_SkipsTerminalAddedEventsOnlyWhenInBloomFilter(t *testing.T) {
+	ctx := context.Background()
+
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	require.NoError(t, err)
+
+	c := &ActionsClient{
+		runClient:      mockClient,
+		recordedFilter: filter,
+		subscribers:    make(map[string]map[chan *ActionUpdate]struct{}),
+	}
+
+	// Create a terminal TaskAction CRD (SUCCEEDED)
+	ta := &executorv1.TaskAction{
+		Spec: executorv1.TaskActionSpec{
+			Project:    "proj",
+			Domain:     "dev",
+			RunName:    "run1",
+			ActionName: "completed-action",
+		},
+		Status: executorv1.TaskActionStatus{
+			Conditions: []metav1.Condition{
+				{Type: string(executorv1.ConditionTypeSucceeded), Status: "True"},
+			},
+		},
+	}
+	update := &ActionUpdate{
+		ActionID: &common.ActionIdentifier{
+			Run:  &common.RunIdentifier{Project: "proj", Domain: "dev", Name: "run1"},
+			Name: "completed-action",
+		},
+		Phase: common.ActionPhase_ACTION_PHASE_SUCCEEDED,
+	}
+
+	// First ADDED event (cold start, not in bloom filter): should process normally
+	mockClient.On("RecordAction", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.RecordActionResponse]{}, nil).Once()
+	mockClient.On("UpdateActionStatus", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.UpdateActionStatusResponse]{}, nil)
+	c.notifyRunService(ctx, ta, update, watch.Added)
+
+	mockClient.AssertNumberOfCalls(t, "RecordAction", 1)
+	mockClient.AssertNumberOfCalls(t, "UpdateActionStatus", 1)
+
+	// Action should now be in the bloom filter
+	actionKey := []byte(buildTaskActionName(update.ActionID))
+	assert.True(t, filter.Contains(ctx, actionKey))
+
+	// Second ADDED event (reconnect, in bloom filter): should skip RecordAction
+	// but still call UpdateActionStatus.
+	c.notifyRunService(ctx, ta, update, watch.Added)
+	mockClient.AssertNumberOfCalls(t, "RecordAction", 1)       // no new RecordAction
+	mockClient.AssertNumberOfCalls(t, "UpdateActionStatus", 2) // one more UpdateActionStatus
+}
+
+func TestNotifyRunService_ProcessesNonTerminalAddedEvents(t *testing.T) {
+	ctx := context.Background()
+
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	require.NoError(t, err)
+
+	c := &ActionsClient{
+		runClient:      mockClient,
+		recordedFilter: filter,
+		subscribers:    make(map[string]map[chan *ActionUpdate]struct{}),
+	}
+
+	// Create a non-terminal TaskAction CRD (QUEUED)
+	ta := &executorv1.TaskAction{
+		Spec: executorv1.TaskActionSpec{
+			Project:    "proj",
+			Domain:     "dev",
+			RunName:    "run1",
+			ActionName: "queued-action",
+		},
+		Status: executorv1.TaskActionStatus{
+			Conditions: []metav1.Condition{
+				{Type: string(executorv1.ConditionTypeProgressing), Status: "True", Reason: string(executorv1.ConditionReasonQueued)},
+			},
+		},
+	}
+	update := &ActionUpdate{
+		ActionID: &common.ActionIdentifier{
+			Run:  &common.RunIdentifier{Project: "proj", Domain: "dev", Name: "run1"},
+			Name: "queued-action",
+		},
+		Phase: common.ActionPhase_ACTION_PHASE_QUEUED,
+	}
+
+	// Non-terminal ADDED events should be processed normally
+	mockClient.On("RecordAction", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.RecordActionResponse]{}, nil).Once()
+	mockClient.On("UpdateActionStatus", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.UpdateActionStatusResponse]{}, nil).Once()
+
+	c.notifyRunService(ctx, ta, update, watch.Added)
+
+	mockClient.AssertNumberOfCalls(t, "RecordAction", 1)
+	mockClient.AssertNumberOfCalls(t, "UpdateActionStatus", 1)
+}
+
+func TestNotifyRunService_DuplicateAddedSkipsRecordAction(t *testing.T) {
+	ctx := context.Background()
+
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	require.NoError(t, err)
+
+	c := &ActionsClient{
+		runClient:      mockClient,
+		recordedFilter: filter,
+		subscribers:    make(map[string]map[chan *ActionUpdate]struct{}),
+	}
+
+	ta, update := newTestActionUpdate("action-dup")
+	update.Phase = common.ActionPhase_ACTION_PHASE_RUNNING
+
+	// First call — should process normally
+	mockClient.On("RecordAction", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.RecordActionResponse]{}, nil).Once()
+	mockClient.On("UpdateActionStatus", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.UpdateActionStatusResponse]{}, nil)
+	c.notifyRunService(ctx, ta, update, watch.Added)
+
+	// Second call (duplicate ADDED) — should skip RecordAction but still call UpdateActionStatus
+	c.notifyRunService(ctx, ta, update, watch.Added)
+
+	mockClient.AssertNumberOfCalls(t, "RecordAction", 1)
+	mockClient.AssertNumberOfCalls(t, "UpdateActionStatus", 2)
+}
+
+func TestNotifyRunService_TerminalDuplicateRepairsTimestamps(t *testing.T) {
+	ctx := context.Background()
+
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	require.NoError(t, err)
+
+	c := &ActionsClient{
+		runClient:      mockClient,
+		recordedFilter: filter,
+		subscribers:    make(map[string]map[chan *ActionUpdate]struct{}),
+	}
+
+	ta, update := newTestActionUpdate("action-terminal-dup")
+	update.Phase = common.ActionPhase_ACTION_PHASE_SUCCEEDED
+
+	// First call — should process normally (RecordAction + UpdateActionStatus)
+	mockClient.On("RecordAction", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.RecordActionResponse]{}, nil).Once()
+	mockClient.On("UpdateActionStatus", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.UpdateActionStatusResponse]{}, nil).Times(2)
+	c.notifyRunService(ctx, ta, update, watch.Added)
+
+	// Second call (terminal duplicate ADDED) — should skip RecordAction but
+	// still call UpdateActionStatus to repair missing timestamps.
+	c.notifyRunService(ctx, ta, update, watch.Added)
+
+	mockClient.AssertNumberOfCalls(t, "RecordAction", 1)       // no new RecordAction
+	mockClient.AssertNumberOfCalls(t, "UpdateActionStatus", 2) // one more UpdateActionStatus
+}
+
+func TestNotifyRunService_RootActionAddedDoesNotPromoteParent(t *testing.T) {
+	ctx := context.Background()
+
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+	c := &ActionsClient{
+		recordedFilter: testFilter(),
+		runClient:      mockClient,
+		subscribers:    make(map[string]map[chan *ActionUpdate]struct{}),
+	}
+
+	// Root action has no parent
+	ta, update := newTestActionUpdate("action-root")
+
+	mockClient.On("RecordAction", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.RecordActionResponse]{}, nil).Once()
+
+	c.notifyRunService(ctx, ta, update, watch.Added)
+
+	mockClient.AssertNumberOfCalls(t, "RecordAction", 1)
+	// No UpdateActionStatus should be called for root (no parent to promote)
+	mockClient.AssertNumberOfCalls(t, "UpdateActionStatus", 0)
+}
+
+func newWorkerTestClient(numWorkers, bufSize int) *ActionsClient {
+	c := &ActionsClient{
+		recordedFilter:    testFilter(),
+		numWorkers:        numWorkers,
+		workerChs:         make([]chan watch.Event, numWorkers),
+		dispatchedActions: make(map[string]struct{}),
+	}
+	for i := range c.workerChs {
+		c.workerChs[i] = make(chan watch.Event, bufSize)
+	}
+	return c
+}
+
+func newTaskActionEvent(name string, eventType watch.EventType) watch.Event {
+	ta := &executorv1.TaskAction{}
+	ta.Name = name
+	return watch.Event{Type: eventType, Object: ta}
+}
+
+func newTaskAction(name string) *executorv1.TaskAction {
+	ta := &executorv1.TaskAction{}
+	ta.Name = name
+	return ta
+}
+
+func TestDispatchEvent_ConsistentSharding(t *testing.T) {
+	c := newWorkerTestClient(4, 10)
+
+	// Two DIFFERENT keys that we send once each must land as two items total (one per
+	// key), and each key must always hash to the same single shard.
+	c.dispatchEvent(newTaskAction("run1-action1"), watch.Modified)
+	c.dispatchEvent(newTaskAction("run1-action1"), watch.Modified) // same key -> coalesced away
+	c.dispatchEvent(newTaskAction("run1-action2"), watch.Modified)
+
+	var total int
+	for _, ch := range c.workerChs {
+		total += len(ch)
+	}
+	// action1's two dispatches coalesce to one; action2 adds one -> two items total.
+	assert.Equal(t, 2, total)
+}
+
+func TestDispatchEvent_CoalescesUpdatesForSameKey(t *testing.T) {
+	c := newWorkerTestClient(1, 10)
+	ta := newTaskAction("run1-action1")
+
+	// A burst of updates for the same key, before any worker drains the channel.
+	c.dispatchEvent(ta, watch.Modified)
+	c.dispatchEvent(ta, watch.Modified)
+	c.dispatchEvent(ta, watch.Modified)
+
+	// Only ONE item is queued; the rest coalesce (the worker will read latest state).
+	assert.Equal(t, 1, len(c.workerChs[0]), "same-key updates must coalesce to one queued item")
+
+	// After the item is drained (dispatched marker cleared), a new update dispatches again.
+	<-c.workerChs[0]
+	c.dispatchedActionsMu.Lock()
+	delete(c.dispatchedActions, ta.Name)
+	c.dispatchedActionsMu.Unlock()
+	c.dispatchEvent(ta, watch.Modified)
+	assert.Equal(t, 1, len(c.workerChs[0]), "a fresh update after drain must enqueue again")
+}
+
+func succeededTaskAction(name string) *executorv1.TaskAction {
+	ta := &executorv1.TaskAction{
+		Spec: executorv1.TaskActionSpec{Project: "p", Domain: "d", RunName: "run1", ActionName: name},
+	}
+	ta.Name = name
+	ta.Status.Conditions = []metav1.Condition{{Type: string(executorv1.ConditionTypeSucceeded), Status: metav1.ConditionTrue}}
+	return ta
+}
+
+func runningTaskAction(name string) *executorv1.TaskAction {
+	ta := &executorv1.TaskAction{
+		Spec: executorv1.TaskActionSpec{Project: "p", Domain: "d", RunName: "run1", ActionName: name},
+	}
+	ta.Name = name
+	ta.Status.Conditions = []metav1.Condition{{
+		Type: string(executorv1.ConditionTypeProgressing), Status: metav1.ConditionTrue,
+		Reason: string(executorv1.ConditionReasonExecuting),
+	}}
+	return ta
+}
+
+// When queued→running→succeeded pile up while the worker is behind, the coalesced
+// item must be processed at the LATEST state (SUCCEEDED) — a single terminal
+// UpdateActionStatus, never an intermediate RUNNING.
+func TestHandleWatchEvent_CoalescedReadsLatestPhase(t *testing.T) {
+	ctx := context.Background()
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	require.NoError(t, err)
+
+	c := &ActionsClient{
+		runClient:         mockClient,
+		recordedFilter:    filter,
+		subscribers:       make(map[string]map[chan *ActionUpdate]struct{}),
+		dispatchedActions: map[string]struct{}{"a3": {}}, // an event for a3 is already dispatched
+	}
+	// The executor advanced the CRD to SUCCEEDED before the worker ran.
+	c.getLatest = func(_ context.Context, name string) (*executorv1.TaskAction, bool, error) {
+		return succeededTaskAction(name), true, nil
+	}
+
+	mockClient.On("RecordAction", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.RecordActionResponse]{}, nil).Once()
+	// Accept exactly one status update, and ONLY if it is SUCCEEDED. A RUNNING update
+	// would be an unexpected call and fail the test.
+	mockClient.On("UpdateActionStatus", mock.Anything, mock.MatchedBy(func(req *connect.Request[workflow.UpdateActionStatusRequest]) bool {
+		return req.Msg.GetStatus().GetPhase() == common.ActionPhase_ACTION_PHASE_SUCCEEDED
+	})).Return(&connect.Response[workflow.UpdateActionStatusResponse]{}, nil).Once()
+
+	// The dispatched snapshot was RUNNING, but the worker reads the latest (SUCCEEDED).
+	c.handleWatchEvent(ctx, watch.Event{Type: watch.Modified, Object: runningTaskAction("a3")})
+
+	mockClient.AssertNumberOfCalls(t, "UpdateActionStatus", 1)
+	mockClient.AssertNumberOfCalls(t, "RecordAction", 1)
+}
+
+// TestHandleWatchEvent_CreateThenDeleteStillRecords covers the create-then-immediately-delete
+// race: the coalesced ADDED is processed after the object is already gone from the cache
+// (getLatest -> not found -> handleWatchEvent bails without recording), so the DELETE event
+// must record the action before its terminal update. Otherwise UpdateActionStatus would match
+// zero rows and the action would be lost.
+func TestHandleWatchEvent_CreateThenDeleteStillRecords(t *testing.T) {
+	ctx := context.Background()
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	require.NoError(t, err)
+
+	c := &ActionsClient{
+		runClient:         mockClient,
+		recordedFilter:    filter,
+		subscribers:       make(map[string]map[chan *ActionUpdate]struct{}),
+		dispatchedActions: map[string]struct{}{"d1": {}},
+	}
+	// The CR was deleted before the worker reached the coalesced ADDED, so the cache
+	// no longer has it.
+	c.getLatest = func(_ context.Context, _ string) (*executorv1.TaskAction, bool, error) {
+		return nil, false, nil
+	}
+
+	// Step 1: the coalesced ADDED is processed but the object is already gone — nothing
+	// is recorded or updated here (exactly the gap the fix closes).
+	c.handleWatchEvent(ctx, watch.Event{Type: watch.Added, Object: runningTaskAction("d1")})
+	mockClient.AssertNotCalled(t, "RecordAction")
+	mockClient.AssertNotCalled(t, "UpdateActionStatus")
+
+	// Step 2: the DELETE tombstone (still carries Spec) must create the row, then abort it.
+	mockClient.On("RecordAction", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.RecordActionResponse]{}, nil).Once()
+	mockClient.On("UpdateActionStatus", mock.Anything, mock.MatchedBy(func(req *connect.Request[workflow.UpdateActionStatusRequest]) bool {
+		return req.Msg.GetStatus().GetPhase() == common.ActionPhase_ACTION_PHASE_ABORTED
+	})).Return(&connect.Response[workflow.UpdateActionStatusResponse]{}, nil).Once()
+
+	c.handleWatchEvent(ctx, watch.Event{Type: watch.Deleted, Object: runningTaskAction("d1")})
+
+	mockClient.AssertNumberOfCalls(t, "RecordAction", 1)
+	mockClient.AssertNumberOfCalls(t, "UpdateActionStatus", 1)
+}
+
+// TestHandleWatchEvent_DeleteAfterRecordDoesNotDoubleRecord verifies the mandatory dedup
+// filter keeps the DELETE record path idempotent: an action already recorded on its normal
+// lifecycle is not recorded a second time when its terminal DELETE arrives.
+func TestHandleWatchEvent_DeleteAfterRecordDoesNotDoubleRecord(t *testing.T) {
+	ctx := context.Background()
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	require.NoError(t, err)
+
+	c := &ActionsClient{
+		runClient:      mockClient,
+		recordedFilter: filter,
+		subscribers:    make(map[string]map[chan *ActionUpdate]struct{}),
+	}
+	// Pre-mark the action as already recorded (normal ADDED/MODIFIED lifecycle).
+	c.recordedFilter.Add(ctx, []byte(buildTaskActionName(&common.ActionIdentifier{
+		Run:  &common.RunIdentifier{Project: "p", Domain: "d", Name: "run1"},
+		Name: "d2",
+	})))
+
+	// Only the terminal update is expected; no second RecordAction.
+	mockClient.On("UpdateActionStatus", mock.Anything, mock.Anything).
+		Return(&connect.Response[workflow.UpdateActionStatusResponse]{}, nil).Once()
+
+	c.handleTaskActionEvent(ctx, runningTaskAction("d2"), watch.Deleted)
+
+	mockClient.AssertNotCalled(t, "RecordAction")
+	mockClient.AssertNumberOfCalls(t, "UpdateActionStatus", 1)
+}
+
+// With several actions replicas, another replica can record the terminal status and
+// label the TaskAction before this one's worker reads it. Parents watching through
+// this replica must still get the update; only the run service is skipped.
+func TestHandleWatchEvent_LabelledLatestStillNotifiesSubscribers(t *testing.T) {
+	ctx := context.Background()
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+
+	c := &ActionsClient{
+		runClient:      mockClient,
+		recordedFilter: testFilter(),
+		bufferSize:     10,
+		subscribers:    make(map[string]map[chan *ActionUpdate]struct{}),
+	}
+	parent := "a0"
+	c.getLatest = func(_ context.Context, name string) (*executorv1.TaskAction, bool, error) {
+		ta := succeededTaskAction(name)
+		ta.Spec.ParentActionName = &parent
+		ta.Labels = map[string]string{labelTerminalStatusRecorded: "true"}
+		return ta, true, nil
+	}
+	ch := c.Subscribe("run1", parent)
+
+	c.handleWatchEvent(ctx, watch.Event{Type: watch.Modified, Object: runningTaskAction("c1")})
+
+	select {
+	case got := <-ch:
+		assert.Equal(t, common.ActionPhase_ACTION_PHASE_SUCCEEDED, got.Phase)
+	default:
+		t.Fatal("subscriber did not receive the labelled terminal update")
+	}
+	mockClient.AssertNotCalled(t, "RecordAction")
+	mockClient.AssertNotCalled(t, "UpdateActionStatus")
+}
+
+func TestDispatchEvent_DifferentNamesCanLandOnDifferentShards(t *testing.T) {
+	c := newWorkerTestClient(4, 10)
+
+	// Send many differently-named events and confirm they spread across shards
+	names := []string{"run1-a", "run1-b", "run1-c", "run1-d", "run1-e", "run1-f", "run1-g", "run1-h"}
+	for _, name := range names {
+		c.dispatchEvent(newTaskAction(name), watch.Modified)
+	}
+
+	var nonEmpty int
+	for _, ch := range c.workerChs {
+		if len(ch) > 0 {
+			nonEmpty++
+		}
+	}
+	assert.Greater(t, nonEmpty, 1, "expected events to spread across more than one shard")
+}
+
+func TestDispatchEvent_NilTaskActionIsIgnored(t *testing.T) {
+	c := newWorkerTestClient(2, 10)
+
+	c.dispatchEvent(nil, watch.Modified)
+
+	for i, ch := range c.workerChs {
+		assert.Equal(t, 0, len(ch), "worker %d should have received nothing", i)
+	}
+}
+
+func TestDispatchEvent_FullChannelBlocks(t *testing.T) {
+	c := newWorkerTestClient(1, 1) // single worker, capacity 1
+
+	c.dispatchEvent(newTaskAction("run1-action1"), watch.Modified) // fills the channel
+
+	// A dispatch for a DIFFERENT key (same shard, since there is one worker) must
+	// block because the channel is full — coalescing only drops same-key duplicates,
+	// not distinct keys. Run it in a goroutine and verify it unblocks once drained.
+	done := make(chan struct{})
+	go func() {
+		c.dispatchEvent(newTaskAction("run1-action2"), watch.Modified)
+		close(done)
+	}()
+
+	// Drain the channel to unblock the sender.
+	<-c.workerChs[0]
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("dispatchEvent did not unblock after channel was drained")
+	}
+}
+
+func TestDispatchEvent_DeepCopiesTaskAction(t *testing.T) {
+	c := newWorkerTestClient(1, 10)
+	taskAction := newTaskAction("run1-action1")
+
+	c.dispatchEvent(taskAction, watch.Modified)
+	taskAction.Name = "mutated-after-dispatch"
+
+	event := <-c.workerChs[0]
+	dispatched, ok := event.Object.(*executorv1.TaskAction)
+	require.True(t, ok)
+	assert.Equal(t, "run1-action1", dispatched.Name)
+}
+
+func TestWorker_ExitsOnStopCh(t *testing.T) {
+	c := &ActionsClient{}
+	ch := make(chan watch.Event, 10)
+	stopCh := make(chan struct{})
+
+	done := make(chan struct{})
+	go func() {
+		c.worker(context.Background(), ch, stopCh)
+		close(done)
+	}()
+
+	close(stopCh)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not exit after stopCh was closed")
+	}
+}
+
+func TestWorker_ExitsOnContextCancel(t *testing.T) {
+	c := &ActionsClient{}
+	ch := make(chan watch.Event, 10)
+	stopCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		c.worker(ctx, ch, stopCh)
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not exit after context was cancelled")
+	}
+}
+
+func TestBuildActionUpdate_PropagatesErrorState(t *testing.T) {
+	ta := &executorv1.TaskAction{
+		Spec: executorv1.TaskActionSpec{
+			Project: "flytesnacks", Domain: "development", RunName: "r1", ActionName: "child",
+			TaskType: "python",
+		},
+		Status: executorv1.TaskActionStatus{
+			Conditions: []metav1.Condition{
+				{Type: string(executorv1.ConditionTypeFailed), Status: metav1.ConditionTrue},
+			},
+			ErrorState: &executorv1.ErrorState{
+				Code: "OOMKilled", Kind: "USER", Message: "container oom",
+			},
+		},
+	}
+
+	upd := buildActionUpdate(context.Background(), ta, watch.Modified)
+
+	if assert.NotNil(t, upd.ErrorState, "buildActionUpdate must propagate Status.ErrorState onto the channel update") {
+		assert.Equal(t, "OOMKilled", upd.ErrorState.Code)
+		assert.Equal(t, "USER", upd.ErrorState.Kind)
+		assert.Equal(t, "container oom", upd.ErrorState.Message)
+	}
+}
+
+func TestBuildActionUpdate_NilErrorStateWhenAbsent(t *testing.T) {
+	ta := &executorv1.TaskAction{
+		Spec: executorv1.TaskActionSpec{
+			Project: "p", Domain: "d", RunName: "r", ActionName: "a", TaskType: "python",
+		},
+	}
+
+	upd := buildActionUpdate(context.Background(), ta, watch.Added)
+
+	assert.Nil(t, upd.ErrorState)
+}
+
+// A delete event (real or DeletedFinalStateUnknown tombstone delivered after
+// informer resync) on a TaskAction that already reached a terminal phase must
+// NOT overwrite the recorded phase with ABORTED.
+func TestBuildActionUpdate_DeleteAfterTerminalPreservesPhase(t *testing.T) {
+	cases := []struct {
+		name      string
+		condition string
+		want      common.ActionPhase
+	}{
+		{"succeeded", string(executorv1.ConditionTypeSucceeded), common.ActionPhase_ACTION_PHASE_SUCCEEDED},
+		{"failed", string(executorv1.ConditionTypeFailed), common.ActionPhase_ACTION_PHASE_FAILED},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ta := &executorv1.TaskAction{
+				Spec: executorv1.TaskActionSpec{
+					Project: "p", Domain: "d", RunName: "r", ActionName: "a",
+				},
+				Status: executorv1.TaskActionStatus{
+					Conditions: []metav1.Condition{
+						{Type: tc.condition, Status: metav1.ConditionTrue},
+					},
+				},
+			}
+
+			upd := buildActionUpdate(context.Background(), ta, watch.Deleted)
+
+			require.NotNil(t, upd)
+			assert.Equal(t, tc.want, upd.Phase, "delete event must not overwrite a terminal phase with ABORTED")
+			assert.True(t, upd.IsDeleted)
+		})
+	}
+}
+
+// A delete event on a TaskAction that is still running (no terminal condition)
+// should still mark the action as ABORTED.
+func TestBuildActionUpdate_DeleteOnNonTerminalForcesAborted(t *testing.T) {
+	ta := &executorv1.TaskAction{
+		Spec: executorv1.TaskActionSpec{
+			Project: "p", Domain: "d", RunName: "r", ActionName: "a",
+		},
+		Status: executorv1.TaskActionStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(executorv1.ConditionTypeProgressing),
+					Status: metav1.ConditionTrue,
+					Reason: string(executorv1.ConditionReasonExecuting),
+				},
+			},
+		},
+	}
+
+	upd := buildActionUpdate(context.Background(), ta, watch.Deleted)
+
+	require.NotNil(t, upd)
+	assert.Equal(t, common.ActionPhase_ACTION_PHASE_ABORTED, upd.Phase)
+	assert.True(t, upd.IsDeleted)
+}
+
+// testFilter builds a small dedup filter for tests. The filter is mandatory on a
+// real client (constructed via NewActionsClient); struct-literal test clients must
+// set it too, otherwise notifyRunService's RecordAction path nil-derefs.
+func testFilter() fastcheck.Filter {
+	f, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	if err != nil {
+		panic(err)
+	}
+	return f
+}
+
+func TestNewActionsClient_FilterSizeValidation(t *testing.T) {
+	// The dedup filter is mandatory, so recordFilterSize must be positive.
+	// Both negative and zero are rejected.
+	_, err := NewActionsClient(nil, nil, "ns", 10, 1, nil, -1, promutils.NewTestScope())
+	require.Error(t, err)
+
+	_, err = NewActionsClient(nil, nil, "ns", 10, 1, nil, 0, promutils.NewTestScope())
+	require.Error(t, err)
+
+	// A positive size builds the mandatory filter.
+	c, err := NewActionsClient(nil, nil, "ns", 10, 1, nil, 128, promutils.NewTestScope())
+	require.NoError(t, err)
+	require.NotNil(t, c.recordedFilter)
+}
+
+// Only cache reads are available; the ActionsClient has no API client to fall back to.
+type indexedTestCache struct {
+	ctrlcache.Cache
+	reader client.Reader
+}
+
+func (c *indexedTestCache) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.reader.Get(ctx, key, obj, opts...)
+}
+func (c *indexedTestCache) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return c.reader.List(ctx, list, opts...)
+}
+
+func TestListChildActions_IndexedCache(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	require.NoError(t, executorv1.AddToScheme(scheme))
+	store := fake.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&executorv1.TaskAction{}, parentActionIndex, indexTaskActionParent).Build()
+	c := &ActionsClient{namespace: "flyte", sharedCache: &indexedTestCache{reader: store}}
+	parentID := &common.ActionIdentifier{Run: &common.RunIdentifier{Project: "proj", Domain: "dev", Name: "run1"}, Name: "a0"}
+	create := func(name, parent, project, domain, run, namespace string) *executorv1.TaskAction {
+		ta := &executorv1.TaskAction{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec:       executorv1.TaskActionSpec{Project: project, Domain: domain, RunName: run, ActionName: name},
+		}
+		if parent != "" {
+			ta.Spec.ParentActionName = &parent
+		}
+		require.NoError(t, store.Create(ctx, ta))
+		return ta
+	}
+	parent := create("run1-a0", "", "proj", "dev", "run1", "flyte")
+	child := create("child", "a0", "proj", "dev", "run1", "flyte")
+	second := create("second", "a0", "proj", "dev", "run1", "flyte")
+	create("other-run", "a0", "proj", "dev", "run2", "flyte")
+	create("other-project", "a0", "other", "dev", "run1", "flyte")
+	create("other-domain", "a0", "proj", "other", "run1", "flyte")
+	create("other-namespace", "a0", "proj", "dev", "run1", "other")
+	create("grandchild", "child", "proj", "dev", "run1", "flyte")
+	create("unrelated-root", "", "proj", "dev", "run1", "flyte")
+	assertNames := func(expected ...string) {
+		t.Helper()
+		got, err := c.ListChildActions(ctx, parentID)
+		require.NoError(t, err)
+		var names []string
+		for _, ta := range got {
+			names = append(names, ta.Name)
+		}
+		assert.ElementsMatch(t, expected, names)
+	}
+	assertNames(parent.Name, child.Name, second.Name)
+	// Returned objects must be safe for callers to mutate.
+	got, err := c.ListChildActions(ctx, parentID)
+	require.NoError(t, err)
+	got[0].Name = "mutated"
+	assertNames(parent.Name, child.Name, second.Name)
+	other := "other-parent"
+	child.Spec.ParentActionName = &other
+	require.NoError(t, store.Update(ctx, child))
+	assertNames(parent.Name, second.Name)
+	require.NoError(t, store.Delete(ctx, parent))
+	assertNames(second.Name)
+	require.NoError(t, store.Delete(ctx, second))
+	assertNames()
+}
+
+// This source supports list/watch, not streaming initial events.
+type startupListWatch struct{ *toolscache.ListWatch }
+
+func (startupListWatch) IsWatchListSemanticsUnSupported() bool { return true }
+
+type watcherStartupCache struct {
+	ctrlcache.Cache
+	informer   toolscache.SharedIndexInformer
+	indexCalls int
+}
+
+func (c *watcherStartupCache) IndexField(_ context.Context, _ client.Object, field string, extract client.IndexerFunc) error {
+	c.indexCalls++
+	return c.informer.AddIndexers(toolscache.Indexers{
+		field: func(obj interface{}) ([]string, error) { return extract(obj.(client.Object)), nil },
+	})
+}
+func (c *watcherStartupCache) GetInformer(context.Context, client.Object, ...ctrlcache.InformerGetOption) (ctrlcache.Informer, error) {
+	return c.informer, nil
+}
+
+func TestStartWatching_AfterInformerStarted(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	w := watch.NewRaceFreeFake()
+	defer w.Stop()
+	informer := toolscache.NewSharedIndexInformer(startupListWatch{&toolscache.ListWatch{
+		ListFunc:  func(metav1.ListOptions) (runtime.Object, error) { return &executorv1.TaskActionList{}, nil },
+		WatchFunc: func(metav1.ListOptions) (watch.Interface, error) { return w, nil },
+	}}, &executorv1.TaskAction{}, 0, toolscache.Indexers{})
+	cache := &watcherStartupCache{informer: informer}
+	require.NoError(t, RegisterTaskActionIndexes(ctx, cache))
+	go informer.Run(ctx.Done())
+	require.True(t, toolscache.WaitForCacheSync(ctx.Done(), informer.HasSynced))
+	c := &ActionsClient{sharedCache: cache, namespace: "flyte", numWorkers: 1, bufferSize: 1}
+	require.NoError(t, c.StartWatching(ctx))
+	defer c.StopWatching()
+	assert.Equal(t, 1, cache.indexCalls, "StartWatching must not register indexes on a running informer")
+	assert.Contains(t, informer.GetIndexer().GetIndexers(), parentActionIndex)
+}

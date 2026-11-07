@@ -1,0 +1,281 @@
+package service
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/common"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/project"
+	projectMocks "github.com/flyteorg/flyte/v2/gen/go/flyteidl2/project/projectconnect/mocks"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/task"
+	triggerpb "github.com/flyteorg/flyte/v2/gen/go/flyteidl2/trigger"
+	mocks "github.com/flyteorg/flyte/v2/runs/repository/mocks"
+	"github.com/flyteorg/flyte/v2/runs/repository/models"
+)
+
+func cronAutomation(kickoffArg string) *task.TriggerAutomationSpec {
+	return &task.TriggerAutomationSpec{
+		Automation: &task.TriggerAutomationSpec_Schedule{
+			Schedule: &task.Schedule{
+				Expression:          &task.Schedule_Cron{Cron: &task.Cron{Expression: "0 0 * * *"}},
+				KickoffTimeInputArg: kickoffArg,
+			},
+		},
+	}
+}
+
+func TestValidateCronExpression(t *testing.T) {
+	tests := []struct {
+		name     string
+		schedule *task.Schedule
+		wantErr  bool
+	}{
+		{
+			name: "structured cron with timezone",
+			schedule: &task.Schedule{
+				Expression: &task.Schedule_Cron{Cron: &task.Cron{
+					Expression: "0 9 * * *",
+					Timezone:   "America/Los_Angeles",
+				}},
+			},
+		},
+		{
+			name: "invalid structured cron",
+			schedule: &task.Schedule{
+				Expression: &task.Schedule_Cron{Cron: &task.Cron{Expression: "invalid"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "legacy cron",
+			schedule: &task.Schedule{
+				Expression: &task.Schedule_CronExpression{CronExpression: "0 9 * * *"},
+			},
+		},
+		{
+			name: "invalid legacy cron",
+			schedule: &task.Schedule{
+				Expression: &task.Schedule_CronExpression{CronExpression: "invalid"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty structured cron",
+			schedule: &task.Schedule{
+				Expression: &task.Schedule_Cron{Cron: &task.Cron{}},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &task.TriggerAutomationSpec{
+				Automation: &task.TriggerAutomationSpec_Schedule{
+					Schedule: tt.schedule,
+				},
+			}
+			err := validateCronExpression("trigger", spec)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// buildTriggerModels maps an offloaded embedded trigger's inputs into the TriggerSpec input_wrapper.
+func TestBuildTriggerModels_OffloadedInputs(t *testing.T) {
+	taskId := &task.TaskIdentifier{Project: "p", Domain: "d", Name: "t", Version: "v1"}
+	offloaded := &common.OffloadedInputData{Uri: "offloaded-inputs/hash123", InputsHash: "hash123"}
+	tts := []*task.TaskTrigger{{
+		Name:           "trig",
+		Spec:           &task.TaskTriggerSpec{InputWrapper: &task.TaskTriggerSpec_OffloadedInputData{OffloadedInputData: offloaded}},
+		AutomationSpec: cronAutomation(""),
+	}}
+
+	triggerModels, err := buildTriggerModels(context.Background(), taskId, tts)
+	require.NoError(t, err)
+	require.Len(t, triggerModels, 1)
+
+	var spec triggerpb.TriggerSpec
+	require.NoError(t, proto.Unmarshal(triggerModels[0].Spec, &spec))
+	assert.Equal(t, "offloaded-inputs/hash123", spec.GetOffloadedInputData().GetUri())
+	assert.Nil(t, spec.GetInputs())
+}
+
+func TestDeployTask(t *testing.T) {
+	ctx := context.Background()
+	mockRepo := mocks.NewRepository(t)
+	mockTaskRepo := mocks.NewTaskRepo(t)
+	mockProjectClient := projectMocks.NewProjectServiceClient(t)
+
+	mockRepo.EXPECT().TaskRepo().Return(mockTaskRepo)
+	mockTaskRepo.EXPECT().CreateTask(ctx, mock.AnythingOfType("*models.Task"), mock.Anything).Return(nil)
+	mockProjectClient.EXPECT().GetProject(ctx, mock.MatchedBy(func(req *connect.Request[project.GetProjectRequest]) bool {
+		return req.Msg.GetId() == "test-project"
+	})).Return(connect.NewResponse(&project.GetProjectResponse{}), nil)
+
+	service := NewTaskService(mockRepo, mockProjectClient)
+
+	req := &task.DeployTaskRequest{
+		TaskId: &task.TaskIdentifier{
+			Org:     "test-org",
+			Project: "test-project",
+			Domain:  "test-domain",
+			Name:    "test-task",
+			Version: "v1",
+		},
+		Spec: &task.TaskSpec{
+			Environment: &task.Environment{
+				Name: "prod",
+			},
+		},
+	}
+
+	resp, err := service.DeployTask(ctx, connect.NewRequest(req))
+	require.NoError(t, err)
+	assert.NotNil(t, resp)
+}
+
+func TestGetTaskDetails(t *testing.T) {
+	ctx := context.Background()
+	mockRepo := mocks.NewRepository(t)
+	mockTaskRepo := mocks.NewTaskRepo(t)
+
+	spec := &task.TaskSpec{
+		Environment: &task.Environment{Name: "prod"},
+	}
+	specBytes, _ := proto.Marshal(spec)
+
+	taskModel := &models.Task{
+		TaskKey: models.TaskKey{
+			Project: "test-project",
+			Domain:  "test-domain",
+			Name:    "test-task",
+			Version: "v1",
+		},
+		Environment:  "prod",
+		FunctionName: "test_func",
+		TaskSpec:     specBytes,
+		CreatedAt:    time.Now(),
+	}
+
+	mockRepo.EXPECT().TaskRepo().Return(mockTaskRepo)
+	mockTaskRepo.EXPECT().GetTask(ctx, mock.AnythingOfType("models.TaskKey")).Return(taskModel, nil)
+
+	service := NewTaskService(mockRepo, nil)
+
+	req := &task.GetTaskDetailsRequest{
+		TaskId: &task.TaskIdentifier{
+			Org:     "test-org",
+			Project: "test-project",
+			Domain:  "test-domain",
+			Name:    "test-task",
+			Version: "v1",
+		},
+	}
+
+	resp, err := service.GetTaskDetails(ctx, connect.NewRequest(req))
+	require.NoError(t, err)
+	assert.NotNil(t, resp)
+	assert.NotNil(t, resp.Msg.Details)
+	assert.Equal(t, "", resp.Msg.Details.TaskId.Org)
+}
+
+func TestListTasks(t *testing.T) {
+	ctx := context.Background()
+	mockRepo := mocks.NewRepository(t)
+	mockTaskRepo := mocks.NewTaskRepo(t)
+
+	taskModels := []*models.Task{
+		{
+			TaskKey: models.TaskKey{
+				Project: "test-project",
+				Domain:  "test-domain",
+				Name:    "task1",
+				Version: "v1",
+			},
+			FunctionName: "func1",
+			CreatedAt:    time.Now(),
+		},
+	}
+
+	result := &models.TaskListResult{
+		Tasks:         taskModels,
+		Total:         1,
+		FilteredTotal: 1,
+	}
+
+	mockRepo.EXPECT().TaskRepo().Return(mockTaskRepo)
+	mockTaskRepo.EXPECT().ListTasks(ctx, mock.AnythingOfType("interfaces.ListResourceInput")).Return(result, nil)
+
+	service := NewTaskService(mockRepo, nil)
+
+	req := &task.ListTasksRequest{
+		ScopeBy: &task.ListTasksRequest_Org{
+			Org: "test-org",
+		},
+		Request: &common.ListRequest{
+			Limit: 10,
+		},
+	}
+
+	resp, err := service.ListTasks(ctx, connect.NewRequest(req))
+	require.NoError(t, err)
+	assert.NotNil(t, resp)
+	assert.Len(t, resp.Msg.Tasks, 1)
+	assert.NotNil(t, resp.Msg.Metadata)
+	assert.Equal(t, uint32(1), resp.Msg.Metadata.Total)
+}
+
+func TestListVersions(t *testing.T) {
+	ctx := context.Background()
+	mockRepo := mocks.NewRepository(t)
+	mockTaskRepo := mocks.NewTaskRepo(t)
+
+	now := time.Now()
+	versions := []*models.TaskVersion{
+		{
+			Version:   "v1",
+			CreatedAt: now,
+		},
+		{
+			Version:   "v2",
+			CreatedAt: now.Add(time.Hour),
+		},
+	}
+
+	mockRepo.EXPECT().TaskRepo().Return(mockTaskRepo)
+	mockTaskRepo.EXPECT().ListVersions(ctx, mock.AnythingOfType("interfaces.ListResourceInput")).Return(versions, nil)
+
+	service := NewTaskService(mockRepo, nil)
+
+	req := &task.ListVersionsRequest{
+		TaskName: &task.TaskName{
+			Org:     "test-org",
+			Project: "test-project",
+			Domain:  "test-domain",
+			Name:    "test-task",
+		},
+		Request: &common.ListRequest{
+			Limit: 10,
+		},
+	}
+
+	resp, err := service.ListVersions(ctx, connect.NewRequest(req))
+	require.NoError(t, err)
+	assert.NotNil(t, resp)
+	assert.Len(t, resp.Msg.Versions, 2)
+	assert.Equal(t, "v1", resp.Msg.Versions[0].Version)
+	assert.Equal(t, "v2", resp.Msg.Versions[1].Version)
+}

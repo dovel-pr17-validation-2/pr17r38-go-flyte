@@ -1,0 +1,1122 @@
+package ray
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"maps"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+	"github.com/samber/lo"
+	"gopkg.in/yaml.v2"
+	batchv1 "k8s.io/api/batch/v1"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	flyteerr "github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/errors"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/logs"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery"
+	pluginsCore "github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/core"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/flytek8s"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/flytek8s/config"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/ioutils"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/k8s"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/tasklog"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/pluginmachinery/utils"
+	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/plugins/k8s/pod"
+	"github.com/flyteorg/flyte/v2/flytestdlib/logger"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/core"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/plugins"
+)
+
+const (
+	rayStateMountPath                  = "/tmp/ray"
+	defaultRayStateVolName             = "system-ray-state"
+	rayTaskType                        = "ray"
+	KindRayJob                         = "RayJob"
+	IncludeDashboard                   = "include-dashboard"
+	NodeIPAddress                      = "node-ip-address"
+	DashboardHost                      = "dashboard-host"
+	DisableUsageStatsStartParameter    = "disable-usage-stats"
+	DisableUsageStatsStartParameterVal = "true"
+	RayHeadContainerName               = "ray-head"
+	RayWorkerContainerName             = "ray-worker"
+	// rayClusterLabelKey is KubeRay's RayClusterLabelKey. KubeRay puts it on every head
+	// and worker pod it creates, naming the RayCluster the pod belongs to, and overwrites
+	// whatever the pod template had in that key. Copied from KubeRay rather than imported
+	// so that the utils package it lives in, which pulls in an HTTP client, stays out of
+	// go.mod's build graph here.
+	rayClusterLabelKey = "ray.io/cluster"
+)
+
+var logTemplateRegexes = struct {
+	RayClusterName *regexp.Regexp
+	RayJobID       *regexp.Regexp
+}{
+	tasklog.MustCreateRegex("rayClusterName"),
+	tasklog.MustCreateRegex("rayJobID"),
+}
+
+// Copy it from KubeRay to avoid adding a new dependency to go.mod.
+// https://github.com/ray-project/kuberay/blob/1ced2b968eabcfee4dcfa61391d307b60e46a2ed/ray-operator/controllers/ray/common/job.go#L122-L145
+var submitterDefaultResourceRequirements = v1.ResourceRequirements{
+	Limits: v1.ResourceList{
+		v1.ResourceCPU:    resource.MustParse("1"),
+		v1.ResourceMemory: resource.MustParse("1Gi"),
+	},
+	Requests: v1.ResourceList{
+		v1.ResourceCPU:    resource.MustParse("500m"),
+		v1.ResourceMemory: resource.MustParse("200Mi"),
+	},
+}
+
+type rayJobResourceHandler struct{}
+
+// The cluster's head and worker pods are where a node daemon records what the hardware did,
+// so the framework has to be able to find them from the RayJob this plugin tracks.
+var _ k8s.ChildPodDiscovery = rayJobResourceHandler{}
+
+func (rayJobResourceHandler) GetProperties() k8s.PluginProperties {
+	maxLength := 47
+	return k8s.PluginProperties{GeneratedNameMaxLength: &maxLength}
+}
+
+// BuildResource Creates a new ray job resource
+func (rayJobResourceHandler) BuildResource(ctx context.Context, taskCtx pluginsCore.TaskExecutionContext) (client.Object, error) {
+	taskTemplate, err := taskCtx.TaskReader().Read(ctx)
+	if err != nil {
+		return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "unable to fetch task specification [%v]", err.Error())
+	} else if taskTemplate == nil {
+		return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "nil task specification")
+	}
+
+	rayJob := plugins.RayJob{}
+	err = utils.UnmarshalStruct(taskTemplate.GetCustom(), &rayJob) //nolint: staticcheck
+	if err != nil {
+		return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "invalid TaskSpecification [%v], Err: [%v]", taskTemplate.GetCustom(), err.Error())
+	}
+
+	podSpec, objectMeta, primaryContainerName, err := flytek8s.ToK8sPodSpec(ctx, taskCtx)
+	if err != nil {
+		return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "Unable to create pod spec: [%v]", err.Error())
+	}
+
+	var primaryContainer *v1.Container
+	var primaryContainerIdx int
+	for idx, c := range podSpec.Containers {
+		if c.Name == primaryContainerName {
+			c := c
+			primaryContainer = &c
+			primaryContainerIdx = idx
+			break
+		}
+	}
+
+	if primaryContainer == nil {
+		return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "Unable to get primary container from the pod: [%v]", err.Error())
+	}
+
+	cfg := GetConfig()
+
+	// Copy rather than alias: the resolved map is filled in below and handed to the RayJob CR, so
+	// aliasing would let one task's start params edit the shared plugin config and every other CR
+	// built from those defaults.
+	headNodeRayStartParams := make(map[string]string)
+	if rayJob.RayCluster.HeadGroupSpec != nil && rayJob.RayCluster.HeadGroupSpec.RayStartParams != nil {
+		maps.Copy(headNodeRayStartParams, rayJob.RayCluster.HeadGroupSpec.RayStartParams)
+	} else if headNode := cfg.Defaults.HeadNode; len(headNode.StartParameters) > 0 {
+		maps.Copy(headNodeRayStartParams, headNode.StartParameters)
+	}
+
+	if _, exist := headNodeRayStartParams[IncludeDashboard]; !exist {
+		headNodeRayStartParams[IncludeDashboard] = strconv.FormatBool(GetConfig().IncludeDashboard)
+	}
+
+	if _, exist := headNodeRayStartParams[NodeIPAddress]; !exist {
+		headNodeRayStartParams[NodeIPAddress] = cfg.Defaults.HeadNode.IPAddress
+	}
+
+	if _, exist := headNodeRayStartParams[DashboardHost]; !exist {
+		headNodeRayStartParams[DashboardHost] = cfg.DashboardHost
+	}
+
+	if _, exists := headNodeRayStartParams[DisableUsageStatsStartParameter]; !exists && !cfg.EnableUsageStats {
+		headNodeRayStartParams[DisableUsageStatsStartParameter] = DisableUsageStatsStartParameterVal
+	}
+
+	podSpec.ServiceAccountName = cfg.ServiceAccount
+
+	rayjob, err := constructRayJob(ctx, taskCtx, &rayJob, objectMeta, *podSpec, headNodeRayStartParams, primaryContainerIdx, *primaryContainer)
+
+	return rayjob, err
+}
+
+// buildGroupPodSpec builds the pod spec for a single Ray group (head or worker),
+// applying that group's extended_resources (if any) on top of the task-level and
+// execution-level extended resources. To avoid applying extended resources twice
+// (which can produce conflicting node-affinity requirements or duplicate shared-memory
+// volumes), the group's extended resources are layered into the task overrides and the
+// pod spec is rebuilt once via ToK8sPodSpec, which performs the effective merge. When a
+// group does not set extended_resources, the already-built base pod spec is reused.
+//
+// The group's effective GPU accelerator is also returned so the pod template builders
+// can re-apply the accelerator node selectors and tolerations after merging the group's
+// custom k8s_pod: ToK8sPodSpec runs before that merge, and skips them when the GPU
+// resource only arrives with the custom pod spec.
+func buildGroupPodSpec(ctx context.Context, taskCtx pluginsCore.TaskExecutionContext, basePodSpec *v1.PodSpec, baseObjectMeta *metav1.ObjectMeta, basePrimaryContainerIdx int, groupExtendedResources *core.ExtendedResources) (*v1.PodSpec, *metav1.ObjectMeta, int, *core.GPUAccelerator, error) {
+	taskTemplate, err := taskCtx.TaskReader().Read(ctx)
+	if err != nil {
+		return nil, nil, 0, nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "Unable to read task template: [%v]", err.Error())
+	} else if taskTemplate == nil {
+		return nil, nil, 0, nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "nil task specification")
+	}
+	// Group-level extended resources override the execution-level overrides, which in
+	// turn override the task-level defaults. ToK8sPodSpec performs the same merge
+	// internally; this computes the result so the effective accelerator can be returned.
+	effectiveOverrides := flytek8s.ApplyExtendedResourcesOverrides(
+		taskCtx.TaskExecutionMetadata().GetOverrides().GetExtendedResources(),
+		groupExtendedResources,
+	)
+	effectiveExtendedResources := flytek8s.ApplyExtendedResourcesOverrides(
+		taskTemplate.GetExtendedResources(),
+		effectiveOverrides,
+	)
+	gpuAccelerator := effectiveExtendedResources.GetGpuAccelerator()
+
+	if groupExtendedResources == nil {
+		return basePodSpec.DeepCopy(), baseObjectMeta, basePrimaryContainerIdx, gpuAccelerator, nil
+	}
+
+	groupTaskCtx := flytek8s.NewPluginTaskExecutionContext(taskCtx, flytek8s.WithExtendedResources(effectiveOverrides))
+
+	podSpec, objectMeta, primaryContainerName, err := flytek8s.ToK8sPodSpec(ctx, groupTaskCtx)
+	if err != nil {
+		return nil, nil, 0, nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "Unable to create pod spec: [%v]", err.Error())
+	}
+
+	primaryContainerIdx := -1
+	for idx, c := range podSpec.Containers {
+		if c.Name == primaryContainerName {
+			primaryContainerIdx = idx
+			break
+		}
+	}
+	if primaryContainerIdx < 0 {
+		return nil, nil, 0, nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "Unable to get primary container from the pod")
+	}
+
+	podSpec.ServiceAccountName = GetConfig().ServiceAccount
+	return podSpec, objectMeta, primaryContainerIdx, gpuAccelerator, nil
+}
+
+func buildAutoscalerOptions(options *plugins.AutoscalerOptions) *rayv1.AutoscalerOptions {
+	var autoScalerOptions *rayv1.AutoscalerOptions
+	if options != nil {
+		autoScalerOptions = &rayv1.AutoscalerOptions{}
+		if idleTimeoutTime := options.GetIdleTimeoutSeconds(); idleTimeoutTime > 0 {
+			autoScalerOptions.IdleTimeoutSeconds = &idleTimeoutTime
+		}
+		if upscalingMode := options.GetUpscalingMode(); upscalingMode != plugins.AutoscalerOptions_UPSCALING_MODE_UNSPECIFIED {
+			var mode rayv1.UpscalingMode
+			switch upscalingMode {
+			case plugins.AutoscalerOptions_UPSCALING_MODE_DEFAULT:
+				mode = rayv1.UpscalingMode("Default")
+			case plugins.AutoscalerOptions_UPSCALING_MODE_CONSERVATIVE:
+				mode = rayv1.UpscalingMode("Conservative")
+			case plugins.AutoscalerOptions_UPSCALING_MODE_AGGRESSIVE:
+				mode = rayv1.UpscalingMode("Aggressive")
+			}
+			autoScalerOptions.UpscalingMode = &mode
+		}
+		if image := options.GetImage(); image != "" {
+			autoScalerOptions.Image = &image
+		}
+		if res, err := flytek8s.ToK8sResourceRequirements(options.GetResources()); err == nil {
+			autoScalerOptions.Resources = res
+		}
+		autoScalerOptions.Env = flytek8s.ToK8sEnvVar(options.GetEnv())
+	}
+	return autoScalerOptions
+}
+
+func constructRayJob(ctx context.Context, taskCtx pluginsCore.TaskExecutionContext, rayJob *plugins.RayJob, objectMeta *metav1.ObjectMeta, taskPodSpec v1.PodSpec, headNodeRayStartParams map[string]string, primaryContainerIdx int, primaryContainer v1.Container) (*rayv1.RayJob, error) {
+	enableIngress := true
+	cfg := GetConfig()
+
+	headPodSpec, headObjectMeta, headPrimaryContainerIdx, headGPUAccelerator, err := buildGroupPodSpec(
+		ctx, taskCtx, &taskPodSpec, objectMeta, primaryContainerIdx, rayJob.RayCluster.HeadGroupSpec.GetExtendedResources())
+	if err != nil {
+		return nil, err
+	}
+	headPodTemplate, err := buildHeadPodTemplate(
+		&headPodSpec.Containers[headPrimaryContainerIdx],
+		headPodSpec,
+		headObjectMeta,
+		taskCtx,
+		rayJob.RayCluster.HeadGroupSpec,
+		headGPUAccelerator,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	rayClusterSpec := rayv1.RayClusterSpec{
+		HeadGroupSpec: rayv1.HeadGroupSpec{
+			Template:       headPodTemplate,
+			ServiceType:    v1.ServiceType(cfg.ServiceType),
+			EnableIngress:  &enableIngress,
+			RayStartParams: headNodeRayStartParams,
+		},
+		WorkerGroupSpecs:        []rayv1.WorkerGroupSpec{},
+		EnableInTreeAutoscaling: &rayJob.RayCluster.EnableAutoscaling,
+		AutoscalerOptions:       buildAutoscalerOptions(rayJob.GetRayCluster().GetAutoscalerOptions()),
+	}
+
+	for _, spec := range rayJob.RayCluster.WorkerGroupSpec {
+		workerPodSpec, workerObjectMeta, workerPrimaryContainerIdx, workerGPUAccelerator, err := buildGroupPodSpec(
+			ctx, taskCtx, &taskPodSpec, objectMeta, primaryContainerIdx, spec.GetExtendedResources())
+		if err != nil {
+			return nil, err
+		}
+		workerPodTemplate, err := buildWorkerPodTemplate(
+			&workerPodSpec.Containers[workerPrimaryContainerIdx],
+			workerPodSpec,
+			workerObjectMeta,
+			taskCtx,
+			spec,
+			workerGPUAccelerator,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		workerNodeRayStartParams := make(map[string]string)
+		if spec.RayStartParams != nil {
+			maps.Copy(workerNodeRayStartParams, spec.RayStartParams)
+		} else if workerNode := cfg.Defaults.WorkerNode; len(workerNode.StartParameters) > 0 {
+			maps.Copy(workerNodeRayStartParams, workerNode.StartParameters)
+		}
+
+		if _, exist := workerNodeRayStartParams[NodeIPAddress]; !exist {
+			workerNodeRayStartParams[NodeIPAddress] = cfg.Defaults.WorkerNode.IPAddress
+		}
+
+		if _, exists := workerNodeRayStartParams[DisableUsageStatsStartParameter]; !exists && !cfg.EnableUsageStats {
+			workerNodeRayStartParams[DisableUsageStatsStartParameter] = DisableUsageStatsStartParameterVal
+		}
+
+		minReplicas := spec.MinReplicas
+		if minReplicas > spec.Replicas {
+			minReplicas = spec.Replicas
+		}
+		maxReplicas := spec.MaxReplicas
+		if maxReplicas < spec.Replicas {
+			maxReplicas = spec.Replicas
+		}
+
+		workerNodeSpec := rayv1.WorkerGroupSpec{
+			GroupName:      spec.GroupName,
+			MinReplicas:    &minReplicas,
+			MaxReplicas:    &maxReplicas,
+			Replicas:       &spec.Replicas,
+			RayStartParams: workerNodeRayStartParams,
+			Template:       workerPodTemplate,
+		}
+
+		rayClusterSpec.WorkerGroupSpecs = append(rayClusterSpec.WorkerGroupSpecs, workerNodeSpec)
+	}
+
+	serviceAccountName := flytek8s.GetServiceAccountNameFromTaskExecutionMetadata(taskCtx.TaskExecutionMetadata())
+	if len(serviceAccountName) == 0 {
+		serviceAccountName = cfg.ServiceAccount
+	}
+
+	rayClusterSpec.HeadGroupSpec.Template.Spec.ServiceAccountName = serviceAccountName
+	for index := range rayClusterSpec.WorkerGroupSpecs {
+		rayClusterSpec.WorkerGroupSpecs[index].Template.Spec.ServiceAccountName = serviceAccountName
+	}
+
+	shutdownAfterJobFinishes := cfg.ShutdownAfterJobFinishes
+	ttlSecondsAfterFinished := &cfg.TTLSecondsAfterFinished
+	if rayJob.ShutdownAfterJobFinishes {
+		shutdownAfterJobFinishes = true
+		ttlSecondsAfterFinished = &rayJob.TtlSecondsAfterFinished
+	}
+
+	submissionMode := rayv1.K8sJobMode
+	switch cfg.SubmissionMode {
+	case string(rayv1.HTTPMode):
+		submissionMode = rayv1.HTTPMode
+	case string(rayv1.SidecarMode):
+		submissionMode = rayv1.SidecarMode
+	case string(rayv1.K8sJobMode), "":
+		// submissionMode already defaults to K8sJobMode
+	default:
+		return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "invalid ray submission mode %q: must be K8sJobMode, HTTPMode or SidecarMode", cfg.SubmissionMode)
+	}
+
+	// A submitter pod only exists in K8sJobMode; in HTTPMode the KubeRay operator
+	// submits the job directly to the head node, so no template is needed.
+	var submitterPodTemplate *v1.PodTemplateSpec
+	if submissionMode == rayv1.K8sJobMode {
+		template := buildSubmitterPodTemplate(&rayClusterSpec, taskCtx)
+		submitterPodTemplate = &template
+	}
+
+	// TODO: This is for backward compatibility. Remove this block once runtime_env is removed from ray proto.
+	var runtimeEnvYaml string
+	runtimeEnvYaml = rayJob.RuntimeEnvYaml
+	// If runtime_env exists but runtime_env_yaml does not, convert runtime_env to runtime_env_yaml
+	if rayJob.RuntimeEnv != "" && rayJob.RuntimeEnvYaml == "" { //nolint: staticcheck
+		runtimeEnvYaml, err = convertBase64RuntimeEnvToYaml(rayJob.RuntimeEnv) //nolint: staticcheck
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	jobSpec := rayv1.RayJobSpec{
+		RayClusterSpec:           &rayClusterSpec,
+		Entrypoint:               strings.Join(primaryContainer.Args, " "),
+		ShutdownAfterJobFinishes: shutdownAfterJobFinishes,
+		TTLSecondsAfterFinished:  *ttlSecondsAfterFinished,
+		RuntimeEnvYAML:           runtimeEnvYaml,
+		SubmitterPodTemplate:     submitterPodTemplate,
+		SubmissionMode:           submissionMode,
+	}
+
+	return &rayv1.RayJob{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       KindRayJob,
+			APIVersion: rayv1.SchemeGroupVersion.String(),
+		},
+		Spec:       jobSpec,
+		ObjectMeta: *objectMeta,
+	}, nil
+}
+
+func convertBase64RuntimeEnvToYaml(s string) (string, error) {
+	// Decode from base64
+	data, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return "", err
+	}
+
+	// Unmarshal JSON
+	var obj map[string]interface{}
+	err = json.Unmarshal(data, &obj)
+	if err != nil {
+		return "", err
+	}
+
+	// Convert to YAML
+	y, err := yaml.Marshal(&obj)
+	if err != nil {
+		return "", err
+	}
+
+	return string(y), nil
+}
+
+func injectLogsSidecar(primaryContainer *v1.Container, podSpec *v1.PodSpec) {
+	cfg := GetConfig()
+	if cfg.LogsSidecar == nil {
+		return
+	}
+	sidecar := cfg.LogsSidecar.DeepCopy()
+
+	// Ray logs integration
+	var rayStateVolMount *v1.VolumeMount
+	// Look for an existing volume mount on the primary container, mounted at /tmp/ray
+	for _, vm := range primaryContainer.VolumeMounts {
+		if vm.MountPath == rayStateMountPath {
+			vm := vm
+			rayStateVolMount = &vm
+			break
+		}
+	}
+	// No existing volume mount exists at /tmp/ray. We create a new volume and volume
+	// mount and add it to the pod and container specs respectively
+	if rayStateVolMount == nil {
+		vol := v1.Volume{
+			Name: defaultRayStateVolName,
+			VolumeSource: v1.VolumeSource{
+				EmptyDir: &v1.EmptyDirVolumeSource{},
+			},
+		}
+		podSpec.Volumes = append(podSpec.Volumes, vol)
+		volMount := v1.VolumeMount{
+			Name:      defaultRayStateVolName,
+			MountPath: rayStateMountPath,
+		}
+		primaryContainer.VolumeMounts = append(primaryContainer.VolumeMounts, volMount)
+		rayStateVolMount = &volMount
+	}
+	// We need to mirror the ray state volume mount into the sidecar as readonly,
+	// so that we can read the logs written by the head node.
+	readOnlyRayStateVolMount := *rayStateVolMount.DeepCopy()
+	readOnlyRayStateVolMount.ReadOnly = true
+
+	// Update volume mounts on sidecar
+	// If one already exists with the desired mount path, simply replace it. Otherwise,
+	// add it to sidecar's volume mounts.
+	foundExistingSidecarVolMount := false
+	for idx, vm := range sidecar.VolumeMounts {
+		if vm.MountPath == rayStateMountPath {
+			foundExistingSidecarVolMount = true
+			sidecar.VolumeMounts[idx] = readOnlyRayStateVolMount
+		}
+	}
+	if !foundExistingSidecarVolMount {
+		sidecar.VolumeMounts = append(sidecar.VolumeMounts, readOnlyRayStateVolMount)
+	}
+
+	// Add sidecar to containers
+	podSpec.Containers = append(podSpec.Containers, *sidecar)
+}
+
+// logNoiseDisablingEnvVars disables Ray's terminal-oriented log decorations (ANSI-colored log
+// prefixes and Ray Data progress bars) so logs collected from non-interactive head and worker
+// pods stay readable. Shared by the head and worker builders to keep the two in sync.
+func logNoiseDisablingEnvVars() []v1.EnvVar {
+	return []v1.EnvVar{
+		{Name: "RAY_COLOR_PREFIX", Value: "0"},
+		{Name: "RAY_DATA_DISABLE_PROGRESS_BARS", Value: "1"},
+	}
+}
+
+func buildHeadPodTemplate(primaryContainer *v1.Container, basePodSpec *v1.PodSpec, objectMeta *metav1.ObjectMeta, taskCtx pluginsCore.TaskExecutionContext, spec *plugins.HeadGroupSpec, gpuAccelerator *core.GPUAccelerator) (v1.PodTemplateSpec, error) {
+	// Some configs are copy from  https://github.com/ray-project/kuberay/blob/b72e6bdcd9b8c77a9dc6b5da8560910f3a0c3ffd/apiserver/pkg/util/cluster.go#L97
+	// They should always be the same, so we could hard code here.
+	primaryContainer.Name = RayHeadContainerName
+
+	envs := []v1.EnvVar{
+		{
+			Name: "MY_POD_IP",
+			ValueFrom: &v1.EnvVarSource{
+				FieldRef: &v1.ObjectFieldSelector{
+					FieldPath: "status.podIP",
+				},
+			},
+		},
+	}
+	envs = append(envs, logNoiseDisablingEnvVars()...)
+
+	// Removed 'a0 ..' / 'pyflyte-execute ..' args from the pod spec.
+	primaryContainer.Args = []string{}
+	primaryContainer.Env = append(primaryContainer.Env, envs...)
+
+	ports := []v1.ContainerPort{
+		{
+			Name:          "redis",
+			ContainerPort: 6379,
+		},
+		{
+			Name:          "head",
+			ContainerPort: 10001,
+		},
+		{
+			Name:          "dashboard",
+			ContainerPort: 8265,
+		},
+	}
+
+	primaryContainer.Ports = append(primaryContainer.Ports, ports...)
+
+	// Inject a sidecar for capturing and exposing Ray job logs
+	injectLogsSidecar(primaryContainer, basePodSpec)
+
+	basePodSpec, err := mergeCustomPodSpec(basePodSpec, spec.GetK8SPod())
+	if err != nil {
+		return v1.PodTemplateSpec{}, err
+	}
+
+	// Re-apply the accelerator node selectors and tolerations now that the group's
+	// custom pod spec is merged: when the GPU resource is requested only via the
+	// group's k8s_pod (not the task container), ToK8sPodSpec ran before the merge
+	// and skipped them. ApplyGPUNodeSelectors is idempotent, so this is a no-op
+	// when they were already applied.
+	flytek8s.ApplyGPUNodeSelectors(basePodSpec, gpuAccelerator)
+
+	basePodSpec = flytek8s.AddTolerationsForExtendedResources(basePodSpec)
+
+	// Re-apply interruptible scheduling now that the group's custom pod spec is
+	// merged: a custom k8s_pod may have appended its own node selector terms (OR'd
+	// by Kubernetes), so the (Non)InterruptibleNodeSelectorRequirement must be added
+	// to every term to keep a non-interruptible pod off spot nodes. Idempotent.
+	flytek8s.ApplyPlatformSchedulingConstraints(taskCtx.TaskExecutionMetadata().IsInterruptible(), basePodSpec)
+
+	podTemplateSpec := v1.PodTemplateSpec{
+		Spec:       *basePodSpec,
+		ObjectMeta: *objectMeta,
+	}
+	cfg := config.GetK8sPluginConfig()
+	podTemplateSpec.SetLabels(utils.UnionMaps(cfg.DefaultLabels, podTemplateSpec.GetLabels(), utils.CopyMap(taskCtx.TaskExecutionMetadata().GetLabels()), spec.GetK8SPod().GetMetadata().GetLabels(),
+		// Applied last: a user label named run, action or attempt would otherwise
+		// overwrite the identity the framework finds this pod by, and a pod it cannot
+		// find is one whose GPU faults never reach the failure.
+		flytek8s.PreservedPodLabels(taskCtx.TaskExecutionMetadata())))
+	podTemplateSpec.SetAnnotations(utils.UnionMaps(cfg.DefaultAnnotations, podTemplateSpec.GetAnnotations(), utils.CopyMap(taskCtx.TaskExecutionMetadata().GetAnnotations()), spec.GetK8SPod().GetMetadata().GetAnnotations(),
+		// Names the container doing the task's own work, so a reader of this pod can tell
+		// it from an injected sidecar that may outlive it.
+		map[string]string{flytek8s.PrimaryContainerKey: primaryContainer.Name}))
+
+	return podTemplateSpec, nil
+}
+
+func buildSubmitterPodTemplate(rayClusterSpec *rayv1.RayClusterSpec, taskCtx pluginsCore.TaskExecutionContext) v1.PodTemplateSpec {
+
+	headPodSpec := rayClusterSpec.HeadGroupSpec.Template.Spec
+
+	tolerations := make([]v1.Toleration, 0)
+	if config.GetK8sPluginConfig() != nil && len(config.GetK8sPluginConfig().DefaultTolerations) > 0 {
+		tolerations = append(tolerations, config.GetK8sPluginConfig().DefaultTolerations...)
+	}
+
+	enableServiceLinks := false
+	podTemplateSpec := v1.PodTemplateSpec{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name: "ray-job-submitter",
+					// Use the image of the Ray head to be defensive against version mismatch issues
+					Image:     headPodSpec.Containers[0].Image,
+					Resources: submitterDefaultResourceRequirements,
+				},
+			},
+			RestartPolicy:      v1.RestartPolicyNever,
+			EnableServiceLinks: &enableServiceLinks,
+			// Run the RayJob submitter pod with the default affinity/tolerations so it lands on the default node.
+			Tolerations: tolerations,
+			Affinity:    config.GetK8sPluginConfig().DefaultAffinity,
+		},
+	}
+	k8sCfg := config.GetK8sPluginConfig()
+	podTemplateSpec.SetLabels(utils.UnionMaps(
+		k8sCfg.DefaultLabels,
+		utils.CopyMap(taskCtx.TaskExecutionMetadata().GetLabels()),
+		flytek8s.PreservedPodLabels(taskCtx.TaskExecutionMetadata()),
+	))
+	podTemplateSpec.SetAnnotations(utils.UnionMaps(k8sCfg.DefaultAnnotations, utils.CopyMap(taskCtx.TaskExecutionMetadata().GetAnnotations())))
+	return podTemplateSpec
+}
+
+func buildWorkerPodTemplate(primaryContainer *v1.Container, basePodSpec *v1.PodSpec, objectMetadata *metav1.ObjectMeta, taskCtx pluginsCore.TaskExecutionContext, spec *plugins.WorkerGroupSpec, gpuAccelerator *core.GPUAccelerator) (v1.PodTemplateSpec, error) {
+	// Some configs are copy from  https://github.com/ray-project/kuberay/blob/b72e6bdcd9b8c77a9dc6b5da8560910f3a0c3ffd/apiserver/pkg/util/cluster.go#L185
+	// They should always be the same, so we could hard code here.
+
+	primaryContainer.Name = RayWorkerContainerName
+
+	primaryContainer.Args = []string{}
+
+	envs := []v1.EnvVar{
+		{
+			Name:  "RAY_DISABLE_DOCKER_CPU_WARNING",
+			Value: "1",
+		},
+		{
+			Name:  "TYPE",
+			Value: "worker",
+		},
+		{
+			Name: "CPU_REQUEST",
+			ValueFrom: &v1.EnvVarSource{
+				ResourceFieldRef: &v1.ResourceFieldSelector{
+					ContainerName: RayWorkerContainerName,
+					Resource:      "requests.cpu",
+				},
+			},
+		},
+		{
+			Name: "CPU_LIMITS",
+			ValueFrom: &v1.EnvVarSource{
+				ResourceFieldRef: &v1.ResourceFieldSelector{
+					ContainerName: RayWorkerContainerName,
+					Resource:      "limits.cpu",
+				},
+			},
+		},
+		{
+			Name: "MEMORY_REQUESTS",
+			ValueFrom: &v1.EnvVarSource{
+				ResourceFieldRef: &v1.ResourceFieldSelector{
+					ContainerName: RayWorkerContainerName,
+					Resource:      "requests.cpu",
+				},
+			},
+		},
+		{
+			Name: "MEMORY_LIMITS",
+			ValueFrom: &v1.EnvVarSource{
+				ResourceFieldRef: &v1.ResourceFieldSelector{
+					ContainerName: RayWorkerContainerName,
+					Resource:      "limits.cpu",
+				},
+			},
+		},
+		{
+			Name: "MY_POD_NAME",
+			ValueFrom: &v1.EnvVarSource{
+				FieldRef: &v1.ObjectFieldSelector{
+					FieldPath: "metadata.name",
+				},
+			},
+		},
+		{
+			Name: "MY_POD_IP",
+			ValueFrom: &v1.EnvVarSource{
+				FieldRef: &v1.ObjectFieldSelector{
+					FieldPath: "status.podIP",
+				},
+			},
+		},
+	}
+	envs = append(envs, logNoiseDisablingEnvVars()...)
+
+	primaryContainer.Env = append(primaryContainer.Env, envs...)
+
+	primaryContainer.Lifecycle = &v1.Lifecycle{
+		PreStop: &v1.LifecycleHandler{
+			Exec: &v1.ExecAction{
+				Command: []string{
+					"/bin/sh", "-c", "ray stop",
+				},
+			},
+		},
+	}
+
+	ports := []v1.ContainerPort{
+		{
+			Name:          "redis",
+			ContainerPort: 6379,
+		},
+		{
+			Name:          "head",
+			ContainerPort: 10001,
+		},
+		{
+			Name:          "dashboard",
+			ContainerPort: 8265,
+		},
+	}
+	primaryContainer.Ports = append(primaryContainer.Ports, ports...)
+
+	basePodSpec, err := mergeCustomPodSpec(basePodSpec, spec.GetK8SPod())
+	if err != nil {
+		return v1.PodTemplateSpec{}, err
+	}
+
+	// Re-apply the accelerator node selectors and tolerations now that the group's
+	// custom pod spec is merged: when the GPU resource is requested only via the
+	// group's k8s_pod (not the task container), ToK8sPodSpec ran before the merge
+	// and skipped them. ApplyGPUNodeSelectors is idempotent, so this is a no-op
+	// when they were already applied.
+	flytek8s.ApplyGPUNodeSelectors(basePodSpec, gpuAccelerator)
+
+	basePodSpec = flytek8s.AddTolerationsForExtendedResources(basePodSpec)
+
+	// Re-apply interruptible scheduling now that the group's custom pod spec is
+	// merged: a custom k8s_pod may have appended its own node selector terms (OR'd
+	// by Kubernetes), so the (Non)InterruptibleNodeSelectorRequirement must be added
+	// to every term to keep a non-interruptible pod off spot nodes. Idempotent.
+	flytek8s.ApplyPlatformSchedulingConstraints(taskCtx.TaskExecutionMetadata().IsInterruptible(), basePodSpec)
+
+	podTemplateSpec := v1.PodTemplateSpec{
+		Spec:       *basePodSpec,
+		ObjectMeta: *objectMetadata,
+	}
+	cfg := config.GetK8sPluginConfig()
+	podTemplateSpec.SetLabels(utils.UnionMaps(cfg.DefaultLabels, podTemplateSpec.GetLabels(), utils.CopyMap(taskCtx.TaskExecutionMetadata().GetLabels()), spec.GetK8SPod().GetMetadata().GetLabels(),
+		// Applied last: a user label named run, action or attempt would otherwise
+		// overwrite the identity the framework finds this pod by, and a pod it cannot
+		// find is one whose GPU faults never reach the failure.
+		flytek8s.PreservedPodLabels(taskCtx.TaskExecutionMetadata())))
+	podTemplateSpec.SetAnnotations(utils.UnionMaps(cfg.DefaultAnnotations, podTemplateSpec.GetAnnotations(), utils.CopyMap(taskCtx.TaskExecutionMetadata().GetAnnotations()), spec.GetK8SPod().GetMetadata().GetAnnotations(),
+		// Names the container doing the task's own work, so a reader of this pod can tell
+		// it from an injected sidecar that may outlive it.
+		map[string]string{flytek8s.PrimaryContainerKey: primaryContainer.Name}))
+	return podTemplateSpec, nil
+}
+
+// Merges a ray head/worker node custom pod specs onto task's generated pod spec
+func mergeCustomPodSpec(podSpec *v1.PodSpec, k8sPod *core.K8SPod) (*v1.PodSpec, error) {
+	if k8sPod == nil {
+		return podSpec, nil
+	}
+
+	if k8sPod.PodSpec == nil {
+		return podSpec, nil
+	}
+
+	var customPodSpec *v1.PodSpec
+
+	err := utils.UnmarshalStructToObj(k8sPod.PodSpec, &customPodSpec) //nolint: staticcheck
+	if err != nil {
+		return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification,
+			"Unable to unmarshal pod spec [%v], Err: [%v]", k8sPod.PodSpec, err.Error())
+	}
+
+	podSpec, err = flytek8s.MergeOverlayPodSpecOntoBase(podSpec, customPodSpec)
+	if err != nil {
+		return nil, err
+	}
+
+	return podSpec, nil
+}
+
+func (rayJobResourceHandler) BuildIdentityResource(ctx context.Context, taskCtx pluginsCore.TaskExecutionMetadata) (client.Object, error) {
+	return &rayv1.RayJob{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       KindRayJob,
+			APIVersion: rayv1.SchemeGroupVersion.String(),
+		},
+	}, nil
+}
+
+// ChildPods implements k8s.ChildPodDiscovery. The pods that run the task are the head and
+// worker pods KubeRay expands from the templates this plugin built, which the framework
+// tracks nothing of, since it tracks the RayJob.
+//
+// The selector is the attempt's own labels, which the head and worker templates carry
+// (see buildHeadPodTemplate and buildWorkerPodTemplate), narrowed by the RayCluster the
+// pods belong to. Both halves are required. The attempt labels alone are not exact: they
+// are sanitized and truncated to the 63 characters a label value allows, so two long
+// action names sharing a prefix collapse onto one value, and a selector built from them
+// would reach another action's pods. The cluster name is what makes the match exact, and
+// it is only knowable from the RayJob's status because KubeRay appends a random suffix
+// to it.
+func (rayJobResourceHandler) ChildPods(
+	_ context.Context,
+	taskCtx pluginsCore.TaskExecutionMetadata,
+	obj client.Object,
+) (labels.Selector, error) {
+	rayJob, ok := obj.(*rayv1.RayJob)
+	if !ok {
+		return nil, fmt.Errorf("expected a RayJob, got %T", obj)
+	}
+
+	selector := flytek8s.AttemptPodSelector(taskCtx)
+	if selector == nil {
+		return nil, nil
+	}
+
+	clusterName := rayJob.Status.RayClusterName
+	if clusterName == "" {
+		// KubeRay fills the cluster name in before it creates the RayCluster, so an empty
+		// one means no pod of this job exists yet and there is nothing on record to find.
+		// Selecting on the attempt labels alone would look anyway, and those labels are
+		// sanitized and truncated to 63 characters, so two long action names that share a
+		// prefix collapse onto the same value and one action's pods would answer for
+		// another's. Looking at nothing is the only safe answer, and it costs nothing.
+		return nil, nil
+	}
+
+	requirement, err := labels.NewRequirement(rayClusterLabelKey, selection.Equals, []string{clusterName})
+	if err != nil {
+		return nil, err
+	}
+
+	return selector.Add(*requirement), nil
+}
+
+func getEventInfoForRayJob(ctx context.Context, logConfig logs.LogConfig, pluginContext k8s.PluginContext, rayJob *rayv1.RayJob) (*pluginsCore.TaskInfo, error) {
+	taskTemplate, err := pluginContext.TaskReader().Read(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read task template. Error: %w", err)
+	}
+	logPlugin, err := logs.InitializeLogPlugins(&logConfig, taskTemplate)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize log plugins. Error: %w", err)
+	}
+
+	var taskLogs []*core.TaskLog
+	taskExecID := pluginContext.TaskExecutionMetadata().GetTaskExecutionID()
+	podList := &v1.PodList{}
+	err = pluginContext.K8sReader().List(ctx, podList, client.MatchingLabels{rayClusterLabelKey: rayJob.Status.RayClusterName})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list node execution pods. Error: %w", err)
+	}
+	// In K8sJobMode the driver's output is in the submitter pod, run by a Job named after the RayJob.
+	submitterPods := &v1.PodList{}
+	err = pluginContext.K8sReader().List(ctx, submitterPods, client.MatchingLabels{batchv1.JobNameLabel: rayJob.Name})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list RayJob submitter pods. Error: %w", err)
+	}
+	podList.Items = append(podList.Items, submitterPods.Items...)
+	var enableVscode bool
+	if rayJob.Spec.RayClusterSpec != nil &&
+		rayJob.Spec.RayClusterSpec.HeadGroupSpec.Template.Spec.Containers != nil &&
+		len(rayJob.Spec.RayClusterSpec.HeadGroupSpec.Template.Spec.Containers) > 0 {
+		enableVscode = flytek8s.IsVscodeEnabled(ctx, rayJob.Spec.RayClusterSpec.HeadGroupSpec.Template.Spec.Containers[0].Env)
+	}
+	input := tasklog.Input{
+		PodName:           fmt.Sprintf("%s-head", rayJob.Status.RayClusterName),
+		Namespace:         rayJob.Namespace,
+		TaskExecutionID:   taskExecID,
+		ExtraTemplateVars: []tasklog.TemplateVar{},
+		EnableVscode:      enableVscode,
+	}
+	if rayJob.Status.JobId != "" {
+		input.ExtraTemplateVars = append(
+			input.ExtraTemplateVars,
+			tasklog.TemplateVar{
+				Regex: logTemplateRegexes.RayJobID,
+				Value: rayJob.Status.JobId,
+			},
+		)
+	}
+	if rayJob.Status.RayClusterName != "" {
+		input.ExtraTemplateVars = append(
+			input.ExtraTemplateVars,
+			tasklog.TemplateVar{
+				Regex: logTemplateRegexes.RayClusterName,
+				Value: rayJob.Status.RayClusterName,
+			},
+		)
+	}
+
+	// TODO: Retrieve the name of head pod from rayJob.status, and add it to task logs
+	// RayJob CRD does not include the name of the worker or head pod for now
+	logOutput, err := logPlugin.GetTaskLogs(input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate task logs. Error: %w", err)
+	}
+	taskLogs = append(taskLogs, logOutput.TaskLogs...)
+
+	// Handling for Ray Dashboard
+	dashboardURLTemplate := GetConfig().DashboardURLTemplate
+	if dashboardURLTemplate != nil &&
+		rayJob.Status.DashboardURL != "" &&
+		rayJob.Status.JobStatus == rayv1.JobStatusRunning {
+		dashboardURLTemplate.LinkType = core.TaskLog_DASHBOARD.String()
+		dashboardURLOutput, err := dashboardURLTemplate.GetTaskLogs(input)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate Ray dashboard link. Error: %w", err)
+		}
+		taskLogs = append(taskLogs, dashboardURLOutput.TaskLogs...)
+	}
+
+	// The other CRD plugins all stamp this, and the framework needs it: it is the failure
+	// time a GPU fault's relevance is measured against, and the bound a child pod's own
+	// anchor is held to. Leaving it unset let a worker still held Running anchor at the
+	// moment of classification instead.
+	occurredAt := time.Now()
+
+	return &pluginsCore.TaskInfo{
+		Logs:       taskLogs,
+		LogContext: logContextForPods(rayJob.Name, podList.Items),
+		OccurredAt: &occurredAt,
+	}, nil
+}
+
+// UpdateLinkReadiness flips the readiness of the dashboard/IDE task links in phaseInfo and
+// stamps a matching phase reason. Exported so wrappers that determine head readiness through a
+// different lookup (e.g. jobs submitted to a pre-existing cluster via ClusterSelector) reuse the
+// exact same link handling.
+func UpdateLinkReadiness(phaseInfo *pluginsCore.PhaseInfo, ready bool) {
+	if phaseInfo == nil || phaseInfo.Info() == nil {
+		return
+	}
+	for _, tl := range phaseInfo.Info().Logs {
+		if tl != nil && tl.LinkType == core.TaskLog_DASHBOARD {
+			tl.Ready = ready
+			if !ready || phaseInfo.Phase() < pluginsCore.PhaseRunning {
+				phaseInfo.WithReason("Ray dashboard is not ready")
+			} else {
+				phaseInfo.WithReason("Ray dashboard is ready")
+			}
+		} else if tl != nil && tl.LinkType == core.TaskLog_IDE {
+			tl.Ready = ready
+			if !ready || phaseInfo.Phase() != pluginsCore.PhaseRunning {
+				phaseInfo.WithReason("Vscode server is not ready")
+			} else {
+				phaseInfo.WithReason("Vscode server is ready")
+			}
+		}
+	}
+}
+
+func isRayHeadReady(ctx context.Context, rayJobName, rayClusterName string, pluginContext k8s.PluginContext) (bool, error) {
+	podList := &v1.PodList{}
+	err := pluginContext.K8sReader().List(ctx, podList, client.MatchingLabels{rayClusterLabelKey: rayClusterName})
+	if err != nil {
+		return false, fmt.Errorf("failed to list node execution pods. Error: %w", err)
+	}
+	pods := lo.Filter(podList.Items, func(pod v1.Pod, _ int) bool {
+		return pod.Status.Phase != v1.PodPending && strings.HasPrefix(pod.Name, rayJobName) && strings.Contains(pod.Name, "head") && flytek8s.GetPrimaryContainerName(&pod) == RayHeadContainerName
+	})
+	if len(pods) == 0 {
+		return false, nil
+	} else if len(pods) == 1 {
+		return pod.IsPodReady(&pods[0]), nil
+	}
+
+	// More than one head pod. Should not happen.
+	logger.Debug(ctx, "Cannot determine Ray head readiness: more than one head pod found")
+	return true, fmt.Errorf("more than one head pod found for Ray job %s", rayJobName)
+}
+
+func logContextForPods(rayJobName string, pods []v1.Pod) *core.LogContext {
+	pods = lo.Filter(pods, func(item v1.Pod, _ int) bool {
+		// Running, Succeeded or Failed is OK
+		return item.Status.Phase != v1.PodPending
+	})
+	logCtx := &core.LogContext{
+		Pods: make([]*core.PodLogContext, len(pods)),
+	}
+	for i, pod := range pods {
+		p := pod
+		// Ray job has name like `az6dh2bxk6wnxn2xv8l6-n0-0`
+		// Ray head primary pod has name like `az6dh2bxk6wnxn2xv8l6-n0-0-raycluster-szwgz-head-z59ss`
+		if strings.HasPrefix(p.Name, rayJobName) && strings.Contains(p.Name, "head") && flytek8s.GetPrimaryContainerName(&p) == RayHeadContainerName {
+			logCtx.PrimaryPodName = p.Name
+		}
+		logCtx.Pods[i] = flytek8s.BuildPodLogContext(&p)
+	}
+	return logCtx
+}
+
+func (plugin rayJobResourceHandler) GetTaskPhase(ctx context.Context, pluginContext k8s.PluginContext, resource client.Object) (pluginsCore.PhaseInfo, error) {
+	rayJob := resource.(*rayv1.RayJob)
+	info, err := getEventInfoForRayJob(ctx, GetConfig().Logs, pluginContext, rayJob)
+	if err != nil {
+		return pluginsCore.PhaseInfoUndefined, err
+	}
+
+	if len(rayJob.Status.JobDeploymentStatus) == 0 {
+		return pluginsCore.PhaseInfoQueuedWithTaskInfo(time.Now(), pluginsCore.DefaultPhaseVersion, "Scheduling", info), nil
+	}
+
+	podName := fmt.Sprintf("%s-head", rayJob.Status.RayClusterName)
+	phaseInfo, err := flytek8s.DemystifyFailedOrPendingPod(ctx, pluginContext, *info, rayJob.Namespace, podName, RayHeadContainerName)
+	if err != nil {
+		logger.Errorf(ctx, "Failed to demystify pod status for ray head node. Error: %v", err)
+	}
+	if phaseInfo.Phase().IsFailure() {
+		// If the ray head node is in a failure state, we can fail fast without checking the RayJob status.
+		return phaseInfo, nil
+	}
+
+	// KubeRay creates a Ray cluster first, and then submits a Ray job to the cluster
+	switch rayJob.Status.JobDeploymentStatus {
+	case rayv1.JobDeploymentStatusInitializing:
+		phaseInfo, err = pluginsCore.PhaseInfoInitializing(rayJob.CreationTimestamp.Time, pluginsCore.DefaultPhaseVersion, "cluster is creating", info), nil
+	case rayv1.JobDeploymentStatusRunning:
+		phaseInfo, err = pluginsCore.PhaseInfoRunning(pluginsCore.DefaultPhaseVersion, info), nil
+	case rayv1.JobDeploymentStatusComplete:
+		phaseInfo, err = pluginsCore.PhaseInfoSuccess(info), nil
+	case rayv1.JobDeploymentStatusSuspending:
+		return pluginsCore.PhaseInfoQueuedWithTaskInfo(time.Now(), pluginsCore.DefaultPhaseVersion, "cluster is about to be suspended", info), nil
+	case rayv1.JobDeploymentStatusSuspended:
+		return pluginsCore.PhaseInfoQueuedWithTaskInfo(time.Now(), pluginsCore.DefaultPhaseVersion, "cluster is suspended", info), nil
+	case rayv1.JobDeploymentStatusFailed:
+		failInfo := fmt.Sprintf("Failed to run Ray job %s with error: [%s] %s", rayJob.Name, rayJob.Status.Reason, rayJob.Status.Message)
+		phaseInfo, err = pluginsCore.PhaseInfoFailure(flyteerr.TaskFailedWithError, failInfo, info), nil
+		taskErrorAbsent := false
+		// A task error is authoritative; use KubeRay's fallback only when no error file exists.
+		if ow := pluginContext.OutputWriter(); ow != nil {
+			reader := ioutils.NewRemoteFileOutputReader(ctx, pluginContext.DataStore(), ow, 0)
+			if hasErr, readerErr := reader.IsError(ctx); readerErr == nil {
+				taskErrorAbsent = !hasErr
+				if hasErr {
+					if execErr, readerErr := reader.ReadError(ctx); readerErr == nil && execErr.GetRecoverability() == core.ContainerError_RECOVERABLE {
+						if execErr.GetKind() == core.ExecutionError_SYSTEM {
+							phaseInfo = pluginsCore.PhaseInfoSystemRetryableFailure(flyteerr.TaskFailedWithError, failInfo, info)
+						} else {
+							phaseInfo = pluginsCore.PhaseInfoRetryableFailure(flyteerr.TaskFailedWithError, failInfo, info)
+						}
+					}
+				}
+			}
+		}
+		if taskErrorAbsent && rayJob.Status.Reason == rayv1.JobDeploymentStatusTransitionGracePeriodExceeded {
+			phaseInfo = pluginsCore.PhaseInfoSystemRetryableFailureWithCleanup(flyteerr.TaskFailedWithError, failInfo, info)
+		}
+	default:
+		// We already handle all known deployment status, so this should never happen unless a future version of ray
+		// introduced a new job status.
+		phaseInfo, err = pluginsCore.PhaseInfoUndefined, fmt.Errorf("unknown job deployment status: %s", rayJob.Status.JobDeploymentStatus)
+	}
+
+	if ready, err := isRayHeadReady(ctx, rayJob.Name, rayJob.Status.RayClusterName, pluginContext); err != nil {
+		logger.Warnf(ctx, "Failed to determine Ray dashboard readiness. Error: %v", err)
+	} else {
+		UpdateLinkReadiness(&phaseInfo, ready)
+	}
+
+	phaseVersionUpdateErr := k8s.MaybeUpdatePhaseVersionFromPluginContext(&phaseInfo, &pluginContext)
+	if phaseVersionUpdateErr != nil {
+		return phaseInfo, phaseVersionUpdateErr
+	}
+
+	return phaseInfo, err
+}
+
+// IsTerminal returns true if the RayJob is in a terminal state (Complete or Failed)
+func (rayJobResourceHandler) IsTerminal(_ context.Context, resource client.Object) (bool, error) {
+	job, ok := resource.(*rayv1.RayJob)
+	if !ok {
+		return false, fmt.Errorf("unexpected resource type: expected *RayJob, got %T", resource)
+	}
+	status := job.Status.JobDeploymentStatus
+	return status == rayv1.JobDeploymentStatusComplete || status == rayv1.JobDeploymentStatusFailed, nil
+}
+
+// GetCompletionTime returns the end time of the RayJob
+func (rayJobResourceHandler) GetCompletionTime(resource client.Object) (time.Time, error) {
+	job, ok := resource.(*rayv1.RayJob)
+	if !ok {
+		return time.Time{}, fmt.Errorf("unexpected resource type: expected *RayJob, got %T", resource)
+	}
+
+	if job.Status.EndTime != nil && !job.Status.EndTime.IsZero() {
+		return job.Status.EndTime.Time, nil
+	}
+
+	// Fallback to start time or creation time
+	if job.Status.StartTime != nil && !job.Status.StartTime.IsZero() {
+		return job.Status.StartTime.Time, nil
+	}
+
+	return job.CreationTimestamp.Time, nil
+}
+
+func init() {
+	if err := rayv1.AddToScheme(scheme.Scheme); err != nil {
+		panic(err)
+	}
+
+	pluginmachinery.PluginRegistry().RegisterScheme(rayTaskType, rayv1.AddToScheme)
+
+	pluginmachinery.PluginRegistry().RegisterK8sPlugin(
+		k8s.PluginEntry{
+			ID:                  rayTaskType,
+			RegisteredTaskTypes: []pluginsCore.TaskType{rayTaskType},
+			ResourceToWatch:     &rayv1.RayJob{},
+			Plugin:              rayJobResourceHandler{},
+			IsDefault:           false,
+			CustomKubeClient: func(ctx context.Context) (pluginsCore.KubeClient, error) {
+				remoteConfig := GetConfig().RemoteClusterConfig
+				if !remoteConfig.Enabled {
+					// use controller-runtime KubeClient
+					return nil, nil
+				}
+
+				kubeConfig, err := k8s.KubeClientConfig(remoteConfig.Endpoint, remoteConfig.Auth)
+				if err != nil {
+					return nil, err
+				}
+
+				return k8s.NewDefaultKubeClient(kubeConfig)
+			},
+		})
+}

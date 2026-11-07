@@ -1,0 +1,32 @@
+package errors
+
+import (
+	"github.com/flyteorg/flyte/v2/flytestdlib/errors"
+)
+
+const (
+	TaskFailedWithError        errors.ErrorCode = "TaskFailedWithError"
+	DownstreamSystemError      errors.ErrorCode = "DownstreamSystemError"
+	TaskFailedUnknownError     errors.ErrorCode = "TaskFailedUnknownError"
+	BadTaskSpecification       errors.ErrorCode = "BadTaskSpecification"
+	TaskEventRecordingFailed   errors.ErrorCode = "TaskEventRecordingFailed"
+	MetadataAccessFailed       errors.ErrorCode = "MetadataAccessFailed"
+	MetadataTooLarge           errors.ErrorCode = "MetadataTooLarge"
+	PluginInitializationFailed errors.ErrorCode = "PluginInitializationFailed"
+	CacheFailed                errors.ErrorCode = "AutoRefreshCacheFailed"
+	RuntimeFailure             errors.ErrorCode = "RuntimeFailure"
+	CorruptedPluginState       errors.ErrorCode = "CorruptedPluginState"
+	ResourceManagerFailure     errors.ErrorCode = "ResourceManagerFailure"
+	BackOffError               errors.ErrorCode = "BackOffError"
+	// AppleSiliconNotAvailable marks a workload that requests the Apple Silicon accelerator on a
+	// backend with no Apple Silicon bridge: anything but a devbox running on an Apple Silicon host.
+	AppleSiliconNotAvailable errors.ErrorCode = "APPLE_SILICON_NOT_AVAILABLE"
+)
+
+func Errorf(errorCode errors.ErrorCode, msgFmt string, args ...interface{}) error {
+	return errors.Errorf(errorCode, msgFmt, args...)
+}
+
+func Wrapf(errorCode errors.ErrorCode, err error, msgFmt string, args ...interface{}) error {
+	return errors.Wrapf(errorCode, err, msgFmt, args...)
+}

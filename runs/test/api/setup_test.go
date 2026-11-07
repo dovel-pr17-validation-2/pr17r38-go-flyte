@@ -1,0 +1,265 @@
+package api
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"testing"
+
+	"time"
+
+	"connectrpc.com/connect"
+	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
+	"github.com/jmoiron/sqlx"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+
+	"github.com/flyteorg/flyte/v2/flytestdlib/database"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/actions/actionsconnect"
+	projectpb "github.com/flyteorg/flyte/v2/gen/go/flyteidl2/project"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/project/projectconnect"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/settings/settingsconnect"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/task/taskconnect"
+	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/workflow/workflowconnect"
+	"github.com/flyteorg/flyte/v2/runs/config"
+	"github.com/flyteorg/flyte/v2/runs/migrations"
+	"github.com/flyteorg/flyte/v2/runs/repository"
+	"github.com/flyteorg/flyte/v2/runs/repository/impl"
+	"github.com/flyteorg/flyte/v2/runs/service"
+)
+
+const (
+	testPort = 8091 // Different port to avoid conflicts with main service
+)
+
+var (
+	endpoint   string
+	testServer *http.Server
+	testDB     *sqlx.DB // Expose DB for cleanup
+)
+
+// TestMain sets up the test environment with PostgreSQL database and runs service
+func TestMain(m *testing.M) {
+	ctx := context.Background()
+	var exitCode int
+
+	defer func() {
+		// Stop server if it was started
+		if testServer != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := testServer.Shutdown(shutdownCtx); err != nil {
+				log.Printf("Test server shutdown error: %v", err)
+			}
+			log.Println("Test server stopped")
+		}
+
+		os.Exit(exitCode)
+	}()
+
+	// Setup: Start embedded PostgreSQL
+	const embeddedPGPort = 15435
+	pg := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Port(embeddedPGPort).
+			Database("flyte_runs_test").
+			Username("postgres").
+			Password("postgres").
+			RuntimePath(fmt.Sprintf("/tmp/embedded-postgres-%d", embeddedPGPort)),
+	)
+	if err := pg.Start(); err != nil {
+		log.Printf("Failed to start embedded postgres: %v", err)
+		exitCode = 1
+		return
+	}
+	defer func() {
+		if err := pg.Stop(); err != nil {
+			log.Printf("Warning: failed to stop embedded postgres: %v", err)
+		}
+	}()
+
+	dbConfig := &database.DbConfig{
+		Postgres: database.PostgresConfig{
+			Host:         "localhost",
+			Port:         embeddedPGPort,
+			DbName:       "flyte_runs_test",
+			User:         "postgres",
+			Password:     "postgres",
+			ExtraOptions: "sslmode=disable",
+		},
+		MaxIdleConnections: 10,
+		MaxOpenConnections: 100,
+	}
+	var err error
+	testDB, err = database.GetDB(ctx, dbConfig, "runs-service-test")
+	if err != nil {
+		log.Printf("Failed to initialize database: %v", err)
+		exitCode = 1
+		return
+	}
+	log.Println("Database initialized")
+	runsConfig := config.GetConfig()
+
+	// Run migrations
+	if err := migrations.RunMigrations(ctx, testDB); err != nil {
+		log.Printf("Failed to run migrations: %v", err)
+		exitCode = 1
+		return
+	}
+	log.Println("Database migrations completed")
+
+	// Create repository and services
+	repo, err := repository.NewRepository(
+		testDB,
+		*dbConfig,
+		repository.NewNotificationConfig(
+			runsConfig.NotificationBufferLimit,
+			runsConfig.NotifyRetryMinBackoff.Duration,
+			runsConfig.NotifyRetryMaxBackoff.Duration,
+			runsConfig.WatchBufferSize,
+			runsConfig.NotifyBatchSize,
+		),
+		metricnoop.NewMeterProvider(),
+	)
+	if err != nil {
+		log.Printf("Failed to create repository: %v", err)
+		exitCode = 1
+		return
+	}
+
+	settingsRepo := impl.NewSettingsRepo(testDB)
+
+	// Services validate project existence through the ProjectService client, so mount a
+	// real ProjectService on the same mux (mirrors production unified mode in setup.go).
+	endpointURL := fmt.Sprintf("http://localhost:%d", testPort)
+	projectSvc := service.NewProjectService(impl.NewProjectRepo(testDB), nil)
+	projectClient := projectconnect.NewProjectServiceClient(http.DefaultClient, endpointURL)
+	taskSvc := service.NewTaskService(repo, projectClient)
+
+	// Create RunService with a no-op actions client (points at test server; not used by watch tests)
+	actionsClient := actionsconnect.NewActionsServiceClient(http.DefaultClient, endpointURL)
+	runSvc := service.NewRunService(repo, settingsRepo, actionsClient, projectClient, "", nil, nil, "", true, runsConfig.IdentityHeaders)
+
+	// Setup HTTP server
+	mux := http.NewServeMux()
+	taskPath, taskHandler := taskconnect.NewTaskServiceHandler(taskSvc)
+	mux.Handle(taskPath, taskHandler)
+
+	projectPath, projectHandler := projectconnect.NewProjectServiceHandler(projectSvc)
+	mux.Handle(projectPath, projectHandler)
+
+	runPath, runHandler := workflowconnect.NewRunServiceHandler(runSvc)
+	mux.Handle(runPath, runHandler)
+
+	internalRunPath, internalRunHandler := workflowconnect.NewInternalRunServiceHandler(runSvc)
+	mux.Handle(internalRunPath, internalRunHandler)
+
+	settingsSvc := service.NewSettingsService(settingsRepo)
+	settingsPath, settingsHandler := settingsconnect.NewSettingsServiceHandler(settingsSvc)
+	mux.Handle(settingsPath, settingsHandler)
+
+	// Add health check
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+
+	endpoint = fmt.Sprintf("http://localhost:%d", testPort)
+	testServer = &http.Server{
+		Addr:      fmt.Sprintf(":%d", testPort),
+		Handler:   mux,
+		Protocols: httpProtocols(),
+	}
+
+	// Start server in background
+	errChan := make(chan error, 1)
+	go func() {
+		log.Printf("Test server starting on %s", endpoint)
+		if err := testServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errChan <- err
+		}
+	}()
+
+	// Wait for either server readiness or startup error
+	readyChan := make(chan bool, 1)
+	go func() {
+		readyChan <- waitForServer(endpoint, 10*time.Second)
+	}()
+
+	select {
+	case err := <-errChan:
+		log.Printf("Test server failed to start: %v", err)
+		exitCode = 1
+		return
+	case ready := <-readyChan:
+		if !ready {
+			log.Printf("Test server failed to start (health check timeout)")
+			exitCode = 1
+			return
+		}
+	}
+	log.Println("Test server is ready")
+
+	// Create the shared fixture project that all tests reference.
+	if _, err := projectSvc.CreateProject(ctx, connect.NewRequest(&projectpb.CreateProjectRequest{
+		Project: &projectpb.Project{Id: testProject, Name: testProject},
+	})); err != nil {
+		log.Printf("Failed to create test project: %v", err)
+		exitCode = 1
+		return
+	}
+
+	// Run tests
+	exitCode = m.Run()
+}
+
+func httpProtocols() *http.Protocols {
+	protocols := &http.Protocols{}
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+	return protocols
+}
+
+// waitForServer waits for the server to be ready
+func waitForServer(url string, timeout time.Duration) bool {
+	client := &http.Client{Timeout: 1 * time.Second}
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url + "/healthz")
+		if err == nil && resp.StatusCode == http.StatusOK {
+			resp.Body.Close()
+			return true
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
+}
+
+// cleanupTestDB clears all tables in the test database
+// This ensures each test starts with a clean state
+func cleanupTestDB(t *testing.T) {
+	t.Helper()
+
+	if testDB == nil {
+		t.Log("Warning: testDB is nil, skipping cleanup")
+		return
+	}
+
+	// Truncate known tables. The projects table is excluded so the shared fixture
+	// project created in TestMain survives across tests.
+	tables := []string{
+		"action_events", "actions", "runs", "tasks", "settings",
+	}
+	for _, table := range tables {
+		if _, err := testDB.Exec(fmt.Sprintf("DELETE FROM %s", table)); err != nil {
+			t.Logf("Warning: Failed to cleanup table %s: %v", table, err)
+		}
+	}
+
+	t.Log("Test database cleaned up")
+}
